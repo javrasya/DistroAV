@@ -72,6 +72,13 @@ typedef struct {
 	uint32_t target_height;
 	enum ndi_scale_type scale_type;
 
+	// Crop settings
+	bool enable_crop;
+	int32_t crop_left;
+	int32_t crop_top;
+	uint32_t crop_width;
+	uint32_t crop_height;
+
 	// Frame rate settings
 	bool enable_custom_framerate;
 	enum ndi_framerate_mode framerate_mode;

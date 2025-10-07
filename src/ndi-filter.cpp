@@ -107,6 +107,20 @@ obs_properties_t *ndi_filter_getproperties(void *)
 
 	obs_properties_add_group(props, "group_resolution", "Resolution Conversion", OBS_GROUP_NORMAL, group_res);
 
+	// Crop Settings (applied AFTER scaling)
+	auto group_crop = obs_properties_create();
+	obs_properties_add_bool(group_crop, "enable_crop", "Enable Crop");
+	obs_properties_add_text(
+		group_crop, "crop_info",
+		"Coordinates in source resolution space (auto-scaled if custom resolution enabled). 0 = full dimension",
+		OBS_TEXT_INFO);
+	obs_properties_add_int(group_crop, "crop_left", "Left (source coords)", 0, 7680, 1);
+	obs_properties_add_int(group_crop, "crop_top", "Top (source coords)", 0, 4320, 1);
+	obs_properties_add_int(group_crop, "crop_width", "Width (0 = full)", 0, 7680, 1);
+	obs_properties_add_int(group_crop, "crop_height", "Height (0 = full)", 0, 4320, 1);
+
+	obs_properties_add_group(props, "group_crop", "Crop Region", OBS_GROUP_NORMAL, group_crop);
+
 	// Custom Frame Rate Settings
 	auto group_fps = obs_properties_create();
 	obs_properties_add_bool(group_fps, "enable_custom_framerate", "Enable Custom Frame Rate");
@@ -164,6 +178,13 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_data_set_default_int(defaults, "custom_height", 1080);
 	obs_data_set_default_int(defaults, "scale_type", NDI_SCALE_BICUBIC);
 
+	// Crop defaults (applied AFTER scaling)
+	obs_data_set_default_bool(defaults, "enable_crop", false);
+	obs_data_set_default_int(defaults, "crop_left", 0);
+	obs_data_set_default_int(defaults, "crop_top", 0);
+	obs_data_set_default_int(defaults, "crop_width", 0);
+	obs_data_set_default_int(defaults, "crop_height", 0);
+
 	// Frame rate defaults
 	obs_data_set_default_bool(defaults, "enable_custom_framerate", false);
 	obs_data_set_default_int(defaults, "framerate_mode", NDI_FRAMERATE_30);
@@ -213,21 +234,97 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		ndi_fps_den = f->converter.target_fps_den;
 	}
 
-	// Send frame(s) - dimensions already set by GPU scaling in render function
+	// Apply crop (AFTER scaling) if enabled
+	uint32_t final_width = f->known_width;
+	uint32_t final_height = f->known_height;
+	uint8_t *final_data = frame->data[0];
+	uint32_t final_linesize = frame->linesize[0];
+
+	if (f->converter.enable_crop && frame && frame->data[0]) {
+		// Get crop coordinates (assumed to be in source resolution space)
+		int32_t crop_left = f->converter.crop_left;
+		int32_t crop_top = f->converter.crop_top;
+		uint32_t crop_width = f->converter.crop_width;
+		uint32_t crop_height = f->converter.crop_height;
+
+		// If custom resolution is enabled, normalize crop coordinates from source to scaled space
+		if (f->converter.enable_custom_resolution && f->converter.target_width > 0 &&
+		    f->converter.target_height > 0) {
+			// Get source dimensions
+			uint32_t source_width = obs_source_get_width(f->obs_source);
+			uint32_t source_height = obs_source_get_height(f->obs_source);
+
+			if (source_width > 0 && source_height > 0) {
+				// Calculate scaling ratios
+				float scale_x = (float)f->known_width / (float)source_width;
+				float scale_y = (float)f->known_height / (float)source_height;
+
+				// Scale crop coordinates proportionally
+				crop_left = (int32_t)((float)crop_left * scale_x);
+				crop_top = (int32_t)((float)crop_top * scale_y);
+				crop_width = (uint32_t)((float)crop_width * scale_x);
+				crop_height = (uint32_t)((float)crop_height * scale_y);
+
+				obs_log(LOG_INFO,
+					"[distroav] Crop normalized from source %ux%u to scaled %ux%u: (%d,%d,%u,%u) "
+					"-> (%d,%d,%u,%u)",
+					source_width, source_height, f->known_width, f->known_height,
+					f->converter.crop_left, f->converter.crop_top, f->converter.crop_width,
+					f->converter.crop_height, crop_left, crop_top, crop_width, crop_height);
+			}
+		}
+
+		// 0 means use full dimension
+		if (crop_width == 0)
+			crop_width = f->known_width;
+		if (crop_height == 0)
+			crop_height = f->known_height;
+
+		// Clamp to valid range
+		if (crop_left < 0)
+			crop_left = 0;
+		if (crop_top < 0)
+			crop_top = 0;
+		// Don't reset to 0 - clamp to max valid position
+		if ((uint32_t)crop_left >= f->known_width)
+			crop_left = f->known_width - 1;
+		if ((uint32_t)crop_top >= f->known_height)
+			crop_top = f->known_height - 1;
+		// Clamp dimensions to fit within frame
+		if (crop_left + crop_width > f->known_width)
+			crop_width = f->known_width - crop_left;
+		if (crop_top + crop_height > f->known_height)
+			crop_height = f->known_height - crop_top;
+
+		obs_log(LOG_INFO, "[distroav] Crop applied: left=%d, top=%d, width=%u, height=%u", crop_left, crop_top,
+			crop_width, crop_height);
+
+		if (crop_width > 0 && crop_height > 0 && (crop_left > 0 || crop_top > 0 ||
+							  crop_width < f->known_width ||
+							  crop_height < f->known_height)) {
+			// Offset pointer to crop region (BGRA = 4 bytes per pixel)
+			final_data = frame->data[0] + (crop_top * final_linesize) + (crop_left * 4);
+			final_width = crop_width;
+			final_height = crop_height;
+			// linesize stays the same (full row stride)
+		}
+	}
+
+	// Send frame(s) - dimensions may be cropped from scaled frame
 	for (int i = 0; i < frames_to_send; i++) {
 		NDIlib_video_frame_v2_t video_frame = {0};
 
 		if (frame && frame->data[0]) {
-			video_frame.xres = f->known_width;
-			video_frame.yres = f->known_height;
+			video_frame.xres = final_width;
+			video_frame.yres = final_height;
 			video_frame.FourCC = NDIlib_FourCC_type_BGRA;
 			video_frame.frame_rate_N = ndi_fps_num;
 			video_frame.frame_rate_D = ndi_fps_den;
 			video_frame.picture_aspect_ratio = 0;
 			video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
 			video_frame.timecode = NDIlib_send_timecode_synthesize;
-			video_frame.p_data = frame->data[0];
-			video_frame.line_stride_in_bytes = frame->linesize[0];
+			video_frame.p_data = final_data;
+			video_frame.line_stride_in_bytes = final_linesize;
 		}
 
 		pthread_mutex_lock(&f->ndi_sender_video_mutex);

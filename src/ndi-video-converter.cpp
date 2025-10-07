@@ -25,6 +25,11 @@
 #define PROP_CUSTOM_WIDTH "custom_width"
 #define PROP_CUSTOM_HEIGHT "custom_height"
 #define PROP_SCALE_TYPE "scale_type"
+#define PROP_ENABLE_CROP "enable_crop"
+#define PROP_CROP_LEFT "crop_left"
+#define PROP_CROP_TOP "crop_top"
+#define PROP_CROP_WIDTH "crop_width"
+#define PROP_CROP_HEIGHT "crop_height"
 #define PROP_ENABLE_CUSTOM_FPS "enable_custom_framerate"
 #define PROP_FRAMERATE_MODE "framerate_mode"
 #define PROP_CUSTOM_FPS_NUM "custom_fps_num"
@@ -152,6 +157,20 @@ void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings
 		converter->target_width = 0;
 		converter->target_height = 0;
 	}
+
+	// Crop settings
+	converter->enable_crop = obs_data_get_bool(settings, PROP_ENABLE_CROP);
+	converter->crop_left = (int32_t)obs_data_get_int(settings, PROP_CROP_LEFT);
+	converter->crop_top = (int32_t)obs_data_get_int(settings, PROP_CROP_TOP);
+	converter->crop_width = (uint32_t)obs_data_get_int(settings, PROP_CROP_WIDTH);
+	converter->crop_height = (uint32_t)obs_data_get_int(settings, PROP_CROP_HEIGHT);
+
+	// Validate crop values (0 means use full dimensions, validated in render)
+	if (converter->crop_left < 0)
+		converter->crop_left = 0;
+	if (converter->crop_top < 0)
+		converter->crop_top = 0;
+	// Allow 0 for width/height (means use full dimensions)
 
 	// Frame rate settings
 	converter->enable_custom_framerate = obs_data_get_bool(settings, PROP_ENABLE_CUSTOM_FPS);
