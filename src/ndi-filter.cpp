@@ -16,6 +16,7 @@
 ******************************************************************************/
 
 #include "plugin-main.h"
+#include "ndi-video-converter.h"
 
 #include <util/platform.h>
 #include <util/threading.h>
@@ -52,6 +53,9 @@ typedef struct {
 
 	uint8_t *audio_conv_buffer;
 	size_t audio_conv_buffer_size;
+
+	// Video converter for custom resolution/FPS
+	ndi_video_converter_t converter;
 } ndi_filter_t;
 
 const char *ndi_filter_getname(void *)
@@ -65,6 +69,8 @@ const char *ndi_audiofilter_getname(void *)
 }
 
 void ndi_filter_update(void *data, obs_data_t *settings);
+void ndi_sender_destroy(ndi_filter_t *filter);
+void ndi_sender_create(ndi_filter_t *filter, obs_data_t *settings);
 
 obs_properties_t *ndi_filter_getproperties(void *)
 {
@@ -77,6 +83,52 @@ obs_properties_t *ndi_filter_getproperties(void *)
 
 	obs_properties_add_text(props, FLT_PROP_GROUPS, obs_module_text("NDIPlugin.FilterProps.NDIGroups"),
 				OBS_TEXT_DEFAULT);
+
+	// Custom Resolution Settings
+	auto group_res = obs_properties_create();
+	obs_properties_add_bool(group_res, "enable_custom_resolution", "Enable Custom Resolution");
+
+	obs_property_t *res_mode = obs_properties_add_list(group_res, "resolution_mode", "Resolution Preset",
+							    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(res_mode, "1280x720 (720p)", NDI_RESOLUTION_720P);
+	obs_property_list_add_int(res_mode, "1920x1080 (1080p)", NDI_RESOLUTION_1080P);
+	obs_property_list_add_int(res_mode, "2560x1440 (1440p)", NDI_RESOLUTION_1440P);
+	obs_property_list_add_int(res_mode, "3840x2160 (4K)", NDI_RESOLUTION_4K);
+	obs_property_list_add_int(res_mode, "Custom", NDI_RESOLUTION_CUSTOM);
+
+	obs_properties_add_int(group_res, "custom_width", "Custom Width", 128, 7680, 1);
+	obs_properties_add_int(group_res, "custom_height", "Custom Height", 72, 4320, 1);
+
+	obs_property_t *scale_type = obs_properties_add_list(group_res, "scale_type", "Scaling Algorithm",
+							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(scale_type, "Fast Bilinear (Fastest)", NDI_SCALE_FAST_BILINEAR);
+	obs_property_list_add_int(scale_type, "Bilinear (Good)", NDI_SCALE_BILINEAR);
+	obs_property_list_add_int(scale_type, "Bicubic (Best)", NDI_SCALE_BICUBIC);
+
+	obs_properties_add_group(props, "group_resolution", "Resolution Conversion", OBS_GROUP_NORMAL, group_res);
+
+	// Custom Frame Rate Settings
+	auto group_fps = obs_properties_create();
+	obs_properties_add_bool(group_fps, "enable_custom_framerate", "Enable Custom Frame Rate");
+
+	obs_property_t *fps_mode = obs_properties_add_list(group_fps, "framerate_mode", "Frame Rate Preset",
+							    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(fps_mode, "5 fps", NDI_FRAMERATE_5);
+	obs_property_list_add_int(fps_mode, "10 fps", NDI_FRAMERATE_10);
+	obs_property_list_add_int(fps_mode, "15 fps", NDI_FRAMERATE_15);
+	obs_property_list_add_int(fps_mode, "24 fps", NDI_FRAMERATE_24);
+	obs_property_list_add_int(fps_mode, "25 fps", NDI_FRAMERATE_25);
+	obs_property_list_add_int(fps_mode, "29.97 fps (NTSC)", NDI_FRAMERATE_2997);
+	obs_property_list_add_int(fps_mode, "30 fps", NDI_FRAMERATE_30);
+	obs_property_list_add_int(fps_mode, "50 fps", NDI_FRAMERATE_50);
+	obs_property_list_add_int(fps_mode, "59.94 fps (NTSC)", NDI_FRAMERATE_5994);
+	obs_property_list_add_int(fps_mode, "60 fps", NDI_FRAMERATE_60);
+	obs_property_list_add_int(fps_mode, "Custom", NDI_FRAMERATE_CUSTOM);
+
+	obs_properties_add_int(group_fps, "custom_fps_num", "Custom FPS Numerator", 1, 240, 1);
+	obs_properties_add_int(group_fps, "custom_fps_den", "Custom FPS Denominator", 1, 1001, 1);
+
+	obs_properties_add_group(props, "group_framerate", "Frame Rate Conversion", OBS_GROUP_NORMAL, group_fps);
 
 	obs_properties_add_button(props, "ndi_apply", obs_module_text("NDIPlugin.FilterProps.ApplySettings"),
 				  [](obs_properties_t *, obs_property_t *, void *private_data) {
@@ -104,116 +156,212 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_log(LOG_DEBUG, "+ndi_filter_getdefaults(...)");
 	obs_data_set_default_string(defaults, FLT_PROP_NAME, obs_module_text("NDIPlugin.FilterProps.NDIName.Default"));
 	obs_data_set_default_string(defaults, FLT_PROP_GROUPS, "");
+
+	// Resolution defaults
+	obs_data_set_default_bool(defaults, "enable_custom_resolution", false);
+	obs_data_set_default_int(defaults, "resolution_mode", NDI_RESOLUTION_1080P);
+	obs_data_set_default_int(defaults, "custom_width", 1920);
+	obs_data_set_default_int(defaults, "custom_height", 1080);
+	obs_data_set_default_int(defaults, "scale_type", NDI_SCALE_BICUBIC);
+
+	// Frame rate defaults
+	obs_data_set_default_bool(defaults, "enable_custom_framerate", false);
+	obs_data_set_default_int(defaults, "framerate_mode", NDI_FRAMERATE_30);
+	obs_data_set_default_int(defaults, "custom_fps_num", 30);
+	obs_data_set_default_int(defaults, "custom_fps_den", 1);
+
 	obs_log(LOG_DEBUG, "-ndi_filter_getdefaults(...)");
+}
+
+bool is_filter_valid(ndi_filter_t *filter)
+{
+	obs_source_t *target = obs_filter_get_target(filter->obs_source);
+	obs_source_t *parent = obs_filter_get_parent(filter->obs_source);
+	if (!target || !parent) {
+		return false;
+	}
+
+	uint32_t width = obs_source_get_width(filter->obs_source);
+	uint32_t height = obs_source_get_height(filter->obs_source);
+
+	// Valid if parent width/height are nonzero, source is enabled, and parent is active
+	bool is_valid = (width != 0) && (height != 0) && obs_source_enabled(filter->obs_source) &&
+			obs_source_active(parent);
+
+	return is_valid;
 }
 
 void ndi_filter_raw_video(void *data, video_data *frame)
 {
 	auto f = (ndi_filter_t *)data;
 
-	if (!frame || !frame->data[0])
-		return;
+	// Check frame rate limiting
+	int frames_to_send = 1;
+	if (f->converter.enable_custom_framerate && frame) {
+		bool should_send = ndi_converter_should_send_frame(&f->converter, frame->timestamp, &frames_to_send);
+		if (!should_send || frames_to_send == 0) {
+			return; // Skip this frame
+		}
+	}
 
-	NDIlib_video_frame_v2_t video_frame = {0};
-	video_frame.xres = f->known_width;
-	video_frame.yres = f->known_height;
-	video_frame.FourCC = NDIlib_FourCC_type_BGRA;
-	video_frame.frame_rate_N = f->ovi.fps_num;
-	video_frame.frame_rate_D = f->ovi.fps_den;
-	video_frame.picture_aspect_ratio = 0; // square pixels
-	video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
-	video_frame.timecode = NDIlib_send_timecode_synthesize;
-	video_frame.p_data = frame->data[0];
-	video_frame.line_stride_in_bytes = frame->linesize[0];
+	// Determine frame rate metadata
+	uint32_t ndi_fps_num = f->ovi.fps_num;
+	uint32_t ndi_fps_den = f->ovi.fps_den;
+	if (f->converter.enable_custom_framerate && f->converter.target_fps_num > 0 &&
+	    f->converter.target_fps_den > 0) {
+		ndi_fps_num = f->converter.target_fps_num;
+		ndi_fps_den = f->converter.target_fps_den;
+	}
 
-	pthread_mutex_lock(&f->ndi_sender_video_mutex);
-	ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
-	pthread_mutex_unlock(&f->ndi_sender_video_mutex);
+	// Send frame(s) - dimensions already set by GPU scaling in render function
+	for (int i = 0; i < frames_to_send; i++) {
+		NDIlib_video_frame_v2_t video_frame = {0};
+
+		if (frame && frame->data[0]) {
+			video_frame.xres = f->known_width;
+			video_frame.yres = f->known_height;
+			video_frame.FourCC = NDIlib_FourCC_type_BGRA;
+			video_frame.frame_rate_N = ndi_fps_num;
+			video_frame.frame_rate_D = ndi_fps_den;
+			video_frame.picture_aspect_ratio = 0;
+			video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
+			video_frame.timecode = NDIlib_send_timecode_synthesize;
+			video_frame.p_data = frame->data[0];
+			video_frame.line_stride_in_bytes = frame->linesize[0];
+		}
+
+		pthread_mutex_lock(&f->ndi_sender_video_mutex);
+		ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
+		pthread_mutex_unlock(&f->ndi_sender_video_mutex);
+	}
 }
 
-void ndi_filter_offscreen_render(void *data, uint32_t, uint32_t)
+void ndi_filter_render_video(void *data, gs_effect_t *)
 {
 	auto f = (ndi_filter_t *)data;
+	obs_source_skip_video_filter(f->obs_source);
 
-	obs_source_t *target = obs_filter_get_parent(f->obs_source);
-	if (!target) {
+	obs_source_t *target = obs_filter_get_target(f->obs_source);
+	obs_source_t *parent = obs_filter_get_parent(f->obs_source);
+
+	if (!target || !parent) {
 		return;
 	}
 
-	uint32_t width = obs_source_get_base_width(target);
-	uint32_t height = obs_source_get_base_height(target);
+	if (!is_filter_valid(f)) {
+		// Send empty frame to indicate invalid filter
+		NDIlib_video_frame_v2_t video_frame = {0};
+		pthread_mutex_lock(&f->ndi_sender_video_mutex);
+		ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
+		pthread_mutex_unlock(&f->ndi_sender_video_mutex);
+		return;
+	}
+
+	uint32_t width = obs_source_get_width(f->obs_source);
+	uint32_t height = obs_source_get_height(f->obs_source);
+
+	// Determine render dimensions (use custom if enabled and different)
+	uint32_t render_width = width;
+	uint32_t render_height = height;
+	if (f->converter.enable_custom_resolution && f->converter.target_width > 0 && f->converter.target_height > 0) {
+		render_width = f->converter.target_width;
+		render_height = f->converter.target_height;
+	}
+
+	if (f->known_width != render_width || f->known_height != render_height) {
+		gs_stagesurface_destroy(f->stagesurface);
+		f->stagesurface = gs_stagesurface_create(render_width, render_height, TEXFORMAT);
+
+		video_output_info vi = {0};
+		vi.format = VIDEO_FORMAT_BGRA;
+		vi.width = render_width;
+		vi.height = render_height;
+		vi.fps_den = f->ovi.fps_den;
+		vi.fps_num = f->ovi.fps_num;
+		vi.cache_size = 16;
+		vi.colorspace = VIDEO_CS_DEFAULT;
+		vi.range = VIDEO_RANGE_DEFAULT;
+		vi.name = obs_source_get_name(f->obs_source);
+
+		video_output_close(f->video_output);
+		video_output_open(&f->video_output, &vi);
+		video_output_connect(f->video_output, nullptr, ndi_filter_raw_video, f);
+
+		f->known_width = render_width;
+		f->known_height = render_height;
+	}
 
 	gs_texrender_reset(f->texrender);
 
-	if (gs_texrender_begin(f->texrender, width, height)) {
+	// Render at target resolution (GPU scaling happens here - this is the key!)
+	if (gs_texrender_begin(f->texrender, render_width, render_height)) {
 		vec4 background;
 		vec4_zero(&background);
 
 		gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
-		gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+		gs_ortho(0.0f, (float)render_width, 0.0f, (float)render_height, -100.0f, 100.0f);
 
 		gs_blend_state_push();
 		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
-		obs_source_video_render(target);
+		if (target == parent) {
+			obs_source_skip_video_filter(f->obs_source);
+		} else {
+			obs_source_video_render(target);
+		}
 
 		gs_blend_state_pop();
 		gs_texrender_end(f->texrender);
 
-		if (f->known_width != width || f->known_height != height) {
+		gs_stage_texture(f->stagesurface, gs_texrender_get_texture(f->texrender));
+		if (gs_stagesurface_map(f->stagesurface, &f->video_data, &f->video_linesize)) {
+			video_frame output_frame;
+			if (video_output_lock_frame(f->video_output, &output_frame, 1, os_gettime_ns())) {
+				uint32_t linesize = output_frame.linesize[0];
+				for (uint32_t i = 0; i < render_height; ++i) {
+					uint32_t dst_offset = linesize * i;
+					uint32_t src_offset = f->video_linesize * i;
+					memcpy(output_frame.data[0] + dst_offset, f->video_data + src_offset, linesize);
+				}
 
-			gs_stagesurface_destroy(f->stagesurface);
-			f->stagesurface = gs_stagesurface_create(width, height, TEXFORMAT);
-
-			video_output_info vi = {0};
-			vi.format = VIDEO_FORMAT_BGRA;
-			vi.width = width;
-			vi.height = height;
-			vi.fps_den = f->ovi.fps_den;
-			vi.fps_num = f->ovi.fps_num;
-			vi.cache_size = 16;
-			vi.colorspace = VIDEO_CS_DEFAULT;
-			vi.range = VIDEO_RANGE_DEFAULT;
-			vi.name = obs_source_get_name(f->obs_source);
-
-			video_output_close(f->video_output);
-			video_output_open(&f->video_output, &vi);
-			video_output_connect(f->video_output, nullptr, ndi_filter_raw_video, f);
-
-			f->known_width = width;
-			f->known_height = height;
-		}
-
-		video_frame output_frame;
-		if (video_output_lock_frame(f->video_output, &output_frame, 1, os_gettime_ns())) {
-			if (f->video_data) {
-				gs_stagesurface_unmap(f->stagesurface);
-				f->video_data = nullptr;
+				video_output_unlock_frame(f->video_output);
 			}
 
-			gs_stage_texture(f->stagesurface, gs_texrender_get_texture(f->texrender));
-			gs_stagesurface_map(f->stagesurface, &f->video_data, &f->video_linesize);
-
-			uint32_t linesize = output_frame.linesize[0];
-			for (uint32_t i = 0; i < f->known_height; ++i) {
-				uint32_t dst_offset = linesize * i;
-				uint32_t src_offset = f->video_linesize * i;
-				memcpy(output_frame.data[0] + dst_offset, f->video_data + src_offset, linesize);
-			}
-
-			video_output_unlock_frame(f->video_output);
+			gs_stagesurface_unmap(f->stagesurface);
 		}
 	}
 }
 
-void ndi_filter_update(void *data, obs_data_t *settings)
+void ndi_sender_destroy(ndi_filter_t *filter)
 {
-	auto f = (ndi_filter_t *)data;
-	auto obs_source = f->obs_source;
-	auto name = obs_source_get_name(obs_source);
-	obs_log(LOG_DEBUG, "+ndi_filter_update(name='%s')", name);
+	if (!filter || !filter->ndi_sender) {
+		return;
+	}
 
-	obs_remove_main_render_callback(ndi_filter_offscreen_render, f);
+	if (!filter->is_audioonly) {
+		pthread_mutex_lock(&filter->ndi_sender_video_mutex);
+	}
+
+	pthread_mutex_lock(&filter->ndi_sender_audio_mutex);
+	ndiLib->send_destroy(filter->ndi_sender);
+	filter->ndi_sender = nullptr;
+	pthread_mutex_unlock(&filter->ndi_sender_audio_mutex);
+
+	if (!filter->is_audioonly) {
+		pthread_mutex_unlock(&filter->ndi_sender_video_mutex);
+	}
+}
+
+void ndi_sender_create(ndi_filter_t *filter, obs_data_t *settings)
+{
+	if (!filter || !filter->obs_source) {
+		return;
+	}
+
+	auto obs_source = filter->obs_source;
+	if (!settings) {
+		settings = obs_source_get_settings(obs_source);
+	}
 
 	NDIlib_send_create_t send_desc;
 	send_desc.p_ndi_name = obs_data_get_string(settings, FLT_PROP_NAME);
@@ -225,17 +373,33 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 	send_desc.clock_video = false;
 	send_desc.clock_audio = false;
 
-	if (!f->is_audioonly) {
-		pthread_mutex_lock(&f->ndi_sender_video_mutex);
+	if (!filter->is_audioonly) {
+		pthread_mutex_lock(&filter->ndi_sender_video_mutex);
 	}
-	pthread_mutex_lock(&f->ndi_sender_audio_mutex);
-	ndiLib->send_destroy(f->ndi_sender);
-	f->ndi_sender = ndiLib->send_create(&send_desc);
-	pthread_mutex_unlock(&f->ndi_sender_audio_mutex);
-	if (!f->is_audioonly) {
-		pthread_mutex_unlock(&f->ndi_sender_video_mutex);
-		obs_add_main_render_callback(ndi_filter_offscreen_render, f);
+
+	pthread_mutex_lock(&filter->ndi_sender_audio_mutex);
+	ndiLib->send_destroy(filter->ndi_sender);
+	filter->ndi_sender = ndiLib->send_create(&send_desc);
+	pthread_mutex_unlock(&filter->ndi_sender_audio_mutex);
+
+	if (!filter->is_audioonly) {
+		pthread_mutex_unlock(&filter->ndi_sender_video_mutex);
 	}
+}
+
+void ndi_filter_update(void *data, obs_data_t *settings)
+{
+	auto f = (ndi_filter_t *)data;
+	auto obs_source = f->obs_source;
+	auto name = obs_source_get_name(obs_source);
+	obs_log(LOG_DEBUG, "+ndi_filter_update(name='%s')", name);
+
+	ndi_sender_create(f, settings);
+
+	// Update video converter settings
+	ndi_converter_update(&f->converter, settings);
+
+	auto groups = obs_data_get_string(settings, FLT_PROP_GROUPS);
 
 	obs_log(LOG_INFO, "NDI Filter Updated: '%s'", name);
 	obs_log(LOG_DEBUG, "-ndi_filter_update(name='%s', groups='%s')", name, groups);
@@ -254,6 +418,9 @@ void *ndi_filter_create(obs_data_t *settings, obs_source_t *obs_source)
 	pthread_mutex_init(&f->ndi_sender_audio_mutex, NULL);
 	obs_get_video_info(&f->ovi);
 	obs_get_audio_info(&f->oai);
+
+	// Initialize video converter
+	ndi_converter_init(&f->converter);
 
 	ndi_filter_update(f, settings);
 
@@ -289,7 +456,6 @@ void ndi_filter_destroy(void *data)
 	auto name = obs_source_get_name(f->obs_source);
 	obs_log(LOG_DEBUG, "+ndi_filter_destroy('%s'...)", name);
 
-	obs_remove_main_render_callback(ndi_filter_offscreen_render, f);
 	video_output_close(f->video_output);
 
 	pthread_mutex_lock(&f->ndi_sender_video_mutex);
@@ -307,6 +473,9 @@ void ndi_filter_destroy(void *data)
 		bfree(f->audio_conv_buffer);
 		f->audio_conv_buffer = nullptr;
 	}
+
+	// Destroy video converter (minimal - only used for FPS conversion state)
+	ndi_converter_destroy(&f->converter);
 
 	bfree(f);
 
@@ -339,12 +508,13 @@ void ndi_filter_tick(void *data, float)
 {
 	auto f = (ndi_filter_t *)data;
 	obs_get_video_info(&f->ovi);
-}
 
-void ndi_filter_videorender(void *data, gs_effect_t *)
-{
-	auto f = (ndi_filter_t *)data;
-	obs_source_skip_video_filter(f->obs_source);
+	if (!is_filter_valid(f)) {
+		return;
+	} else if (!f->ndi_sender) {
+		// If the sender is null then recreate it
+		ndi_sender_create(f, nullptr);
+	}
 }
 
 obs_audio_data *ndi_filter_asyncaudio(void *data, obs_audio_data *audio_data)
@@ -411,7 +581,7 @@ obs_source_info create_ndi_filter_info()
 	ndi_filter_info.update = ndi_filter_update;
 
 	ndi_filter_info.video_tick = ndi_filter_tick;
-	ndi_filter_info.video_render = ndi_filter_videorender;
+	ndi_filter_info.video_render = ndi_filter_render_video;
 
 	// Audio is available only with async sources
 	ndi_filter_info.filter_audio = ndi_filter_asyncaudio;
