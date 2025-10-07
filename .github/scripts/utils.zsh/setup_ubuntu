@@ -42,7 +42,12 @@ if (( ! (${skips[(Ie)all]} + ${skips[(Ie)deps]}) )) {
     build-essential \
     libgles2-mesa-dev \
     libcurl4-openssl-dev \
-    obs-studio
+    obs-studio \
+    libobs-dev
+
+  # Install SIMDe - required by libobs on newer versions
+  # Try to install from repos, if not available it might be bundled with libobs-dev
+  sudo apt-get install ${apt_args} simde-dev 2>/dev/null || log_info "SIMDe not available as separate package"
 
   local -a _qt_packages=()
 
