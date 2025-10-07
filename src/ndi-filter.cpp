@@ -234,70 +234,18 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		ndi_fps_den = f->converter.target_fps_den;
 	}
 
-	// Apply crop (AFTER scaling) if enabled
+	// Apply crop (AFTER scaling) if enabled - use cached values for performance
 	uint32_t final_width = f->known_width;
 	uint32_t final_height = f->known_height;
 	uint8_t *final_data = frame->data[0];
 	uint32_t final_linesize = frame->linesize[0];
 
-	if (f->converter.enable_crop && frame && frame->data[0]) {
-		// Get crop coordinates (assumed to be in source resolution space)
-		int32_t crop_left = f->converter.crop_left;
-		int32_t crop_top = f->converter.crop_top;
-		uint32_t crop_width = f->converter.crop_width;
-		uint32_t crop_height = f->converter.crop_height;
-
-		// If custom resolution is enabled, normalize crop coordinates from source to scaled space
-		if (f->converter.enable_custom_resolution && f->converter.target_width > 0 &&
-		    f->converter.target_height > 0) {
-			// Get source dimensions
-			uint32_t source_width = obs_source_get_width(f->obs_source);
-			uint32_t source_height = obs_source_get_height(f->obs_source);
-
-			if (source_width > 0 && source_height > 0) {
-				// Calculate scaling ratios
-				float scale_x = (float)f->known_width / (float)source_width;
-				float scale_y = (float)f->known_height / (float)source_height;
-
-				// Scale crop coordinates proportionally
-				crop_left = (int32_t)((float)crop_left * scale_x);
-				crop_top = (int32_t)((float)crop_top * scale_y);
-				crop_width = (uint32_t)((float)crop_width * scale_x);
-				crop_height = (uint32_t)((float)crop_height * scale_y);
-
-				obs_log(LOG_DEBUG,
-					"[distroav] Crop normalized from source %ux%u to scaled %ux%u: (%d,%d,%u,%u) "
-					"-> (%d,%d,%u,%u)",
-					source_width, source_height, f->known_width, f->known_height,
-					f->converter.crop_left, f->converter.crop_top, f->converter.crop_width,
-					f->converter.crop_height, crop_left, crop_top, crop_width, crop_height);
-			}
-		}
-
-		// 0 means use full dimension
-		if (crop_width == 0)
-			crop_width = f->known_width;
-		if (crop_height == 0)
-			crop_height = f->known_height;
-
-		// Clamp to valid range
-		if (crop_left < 0)
-			crop_left = 0;
-		if (crop_top < 0)
-			crop_top = 0;
-		// Don't reset to 0 - clamp to max valid position
-		if ((uint32_t)crop_left >= f->known_width)
-			crop_left = f->known_width - 1;
-		if ((uint32_t)crop_top >= f->known_height)
-			crop_top = f->known_height - 1;
-		// Clamp dimensions to fit within frame
-		if (crop_left + crop_width > f->known_width)
-			crop_width = f->known_width - crop_left;
-		if (crop_top + crop_height > f->known_height)
-			crop_height = f->known_height - crop_top;
-
-		obs_log(LOG_DEBUG, "[distroav] Crop applied: left=%d, top=%d, width=%u, height=%u", crop_left, crop_top,
-			crop_width, crop_height);
+	if (f->converter.enable_crop && f->converter.crop_cache_valid && frame && frame->data[0]) {
+		// Use pre-calculated cached crop values (avoids expensive per-frame calculation)
+		int32_t crop_left = f->converter.cached_crop_left;
+		int32_t crop_top = f->converter.cached_crop_top;
+		uint32_t crop_width = f->converter.cached_crop_width;
+		uint32_t crop_height = f->converter.cached_crop_height;
 
 		if (crop_width > 0 && crop_height > 0 && (crop_left > 0 || crop_top > 0 ||
 							  crop_width < f->known_width ||
@@ -386,6 +334,12 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 
 		f->known_width = render_width;
 		f->known_height = render_height;
+
+		// Update crop cache when dimensions change
+		ndi_converter_update_crop_cache(&f->converter, width, height, render_width, render_height);
+	} else if (f->converter.enable_crop && !f->converter.crop_cache_valid) {
+		// Dimensions unchanged but cache invalid (first time enabling crop)
+		ndi_converter_update_crop_cache(&f->converter, width, height, render_width, render_height);
 	}
 
 	gs_texrender_reset(f->texrender);

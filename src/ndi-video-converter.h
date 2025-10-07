@@ -102,6 +102,12 @@ typedef struct {
 	uint32_t source_height;
 	enum video_format source_format;
 
+	// Cached crop values (pre-scaled to avoid per-frame calculation)
+	int32_t cached_crop_left;
+	int32_t cached_crop_top;
+	uint32_t cached_crop_width;
+	uint32_t cached_crop_height;
+	bool crop_cache_valid;
 } ndi_video_converter_t;
 
 /**
@@ -116,6 +122,18 @@ void ndi_converter_init(ndi_video_converter_t *converter);
  * @param settings OBS settings data
  */
 void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings);
+
+/**
+ * Update cached crop values based on source and scaled dimensions.
+ * Call this when source dimensions change or when first enabling crop.
+ * @param converter The converter instance
+ * @param source_width Original source width
+ * @param source_height Original source height
+ * @param scaled_width Width after scaling (if custom res enabled)
+ * @param scaled_height Height after scaling (if custom res enabled)
+ */
+void ndi_converter_update_crop_cache(ndi_video_converter_t *converter, uint32_t source_width, uint32_t source_height,
+				     uint32_t scaled_width, uint32_t scaled_height);
 
 /**
  * Check if resolution scaling is needed and update scaler if necessary.

@@ -125,6 +125,61 @@ void ndi_converter_get_preset_framerate(enum ndi_framerate_mode mode, uint32_t *
 	}
 }
 
+void ndi_converter_update_crop_cache(ndi_video_converter_t *converter, uint32_t source_width, uint32_t source_height,
+				     uint32_t scaled_width, uint32_t scaled_height)
+{
+	if (!converter->enable_crop) {
+		converter->crop_cache_valid = false;
+		return;
+	}
+
+	int32_t crop_left = converter->crop_left;
+	int32_t crop_top = converter->crop_top;
+	uint32_t crop_width = converter->crop_width;
+	uint32_t crop_height = converter->crop_height;
+
+	// If custom resolution is enabled, normalize crop coordinates from source to scaled space
+	if (converter->enable_custom_resolution && converter->target_width > 0 && converter->target_height > 0 &&
+	    source_width > 0 && source_height > 0) {
+		// Calculate scaling ratios
+		float scale_x = (float)scaled_width / (float)source_width;
+		float scale_y = (float)scaled_height / (float)source_height;
+
+		// Scale crop coordinates proportionally
+		crop_left = (int32_t)((float)crop_left * scale_x);
+		crop_top = (int32_t)((float)crop_top * scale_y);
+		crop_width = (uint32_t)((float)crop_width * scale_x);
+		crop_height = (uint32_t)((float)crop_height * scale_y);
+	}
+
+	// 0 means use full dimension
+	if (crop_width == 0)
+		crop_width = scaled_width;
+	if (crop_height == 0)
+		crop_height = scaled_height;
+
+	// Clamp to valid range
+	if (crop_left < 0)
+		crop_left = 0;
+	if (crop_top < 0)
+		crop_top = 0;
+	if ((uint32_t)crop_left >= scaled_width)
+		crop_left = scaled_width - 1;
+	if ((uint32_t)crop_top >= scaled_height)
+		crop_top = scaled_height - 1;
+	if (crop_left + crop_width > scaled_width)
+		crop_width = scaled_width - crop_left;
+	if (crop_top + crop_height > scaled_height)
+		crop_height = scaled_height - crop_top;
+
+	// Store cached values
+	converter->cached_crop_left = crop_left;
+	converter->cached_crop_top = crop_top;
+	converter->cached_crop_width = crop_width;
+	converter->cached_crop_height = crop_height;
+	converter->crop_cache_valid = true;
+}
+
 void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings)
 {
 	// Resolution settings
@@ -171,6 +226,9 @@ void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings
 	if (converter->crop_top < 0)
 		converter->crop_top = 0;
 	// Allow 0 for width/height (means use full dimensions)
+
+	// Invalidate crop cache when settings change
+	converter->crop_cache_valid = false;
 
 	// Frame rate settings
 	converter->enable_custom_framerate = obs_data_get_bool(settings, PROP_ENABLE_CUSTOM_FPS);
