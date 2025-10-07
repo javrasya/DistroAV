@@ -299,7 +299,8 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		vec4_zero(&background);
 
 		gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
-		gs_ortho(0.0f, (float)render_width, 0.0f, (float)render_height, -100.0f, 100.0f);
+		// Ortho uses SOURCE dimensions - source fills render target, causing automatic scaling
+		gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
 
 		gs_blend_state_push();
 		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
