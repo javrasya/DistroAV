@@ -67,7 +67,8 @@ typedef struct {
 	uint32_t frame_width;
 	uint32_t frame_height;
 	NDIlib_FourCC_video_type_e frame_fourcc;
-	double video_framerate;
+	uint32_t video_framerate_num;
+	uint32_t video_framerate_den;
 
 	size_t audio_channels;
 	uint32_t audio_samplerate;
@@ -200,7 +201,12 @@ bool ndi_output_start(void *data)
 
 		o->frame_width = width;
 		o->frame_height = height;
-		o->video_framerate = video_output_get_frame_rate(video);
+
+		// Get proper fractional frame rate
+		const struct video_output_info *voi = video_output_get_info(video);
+		o->video_framerate_num = voi->fps_num;
+		o->video_framerate_den = voi->fps_den;
+
 		flags |= OBS_OUTPUT_VIDEO;
 	}
 
@@ -281,7 +287,8 @@ void ndi_output_stop(void *data, uint64_t)
 
 		o->frame_width = 0;
 		o->frame_height = 0;
-		o->video_framerate = 0.0;
+		o->video_framerate_num = 0;
+		o->video_framerate_den = 0;
 		o->audio_channels = 0;
 		o->audio_samplerate = 0;
 
@@ -319,10 +326,8 @@ void ndi_output_rawvideo(void *data, video_data *frame)
 	NDIlib_video_frame_v2_t video_frame = {0};
 	video_frame.xres = width;
 	video_frame.yres = height;
-	video_frame.frame_rate_N = (int)(o->video_framerate * 100);
-	// TODO fixme: broken on fractional framerates
-	video_frame.frame_rate_D =
-		100; // TODO : investigate if there is a better way to get both _D & _N set to the proper framerate from OBS output.
+	video_frame.frame_rate_N = o->video_framerate_num;
+	video_frame.frame_rate_D = o->video_framerate_den;
 	video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
 	video_frame.timecode = NDIlib_send_timecode_synthesize;
 	video_frame.FourCC = o->frame_fourcc;

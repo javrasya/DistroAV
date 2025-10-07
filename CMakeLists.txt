@@ -58,6 +58,8 @@ target_sources(
     src/ndi-finder.cpp
     src/ndi-output.cpp
     src/ndi-source.cpp
+    src/ndi-video-converter.cpp
+    src/ndi-video-converter.h
     src/plugin-main.cpp
     src/plugin-main.h
     src/premultiplied-alpha-filter.cpp
