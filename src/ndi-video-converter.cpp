@@ -398,10 +398,12 @@ bool ndi_converter_scale_video(ndi_video_converter_t *converter, uint8_t *frame_
 
 bool ndi_converter_should_send_frame(ndi_video_converter_t *converter, uint64_t frame_timestamp, int *frames_to_send)
 {
-	*frames_to_send = 0;
+	if (!converter->enable_custom_framerate || converter->target_frame_interval_ns == 0) {
+		*frames_to_send = 1; // No FPS conversion, send every frame once
+		return true;
+	}
 
-	if (!converter->enable_custom_framerate || converter->target_frame_interval_ns == 0)
-		return true; // No FPS conversion, send all frames
+	*frames_to_send = 0; // Will be calculated below for FPS conversion
 
 	// Calculate elapsed time since last frame
 	int64_t delta_ns = 0;
