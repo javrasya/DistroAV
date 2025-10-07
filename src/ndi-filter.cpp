@@ -265,7 +265,7 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 				crop_width = (uint32_t)((float)crop_width * scale_x);
 				crop_height = (uint32_t)((float)crop_height * scale_y);
 
-				obs_log(LOG_INFO,
+				obs_log(LOG_DEBUG,
 					"[distroav] Crop normalized from source %ux%u to scaled %ux%u: (%d,%d,%u,%u) "
 					"-> (%d,%d,%u,%u)",
 					source_width, source_height, f->known_width, f->known_height,
@@ -296,7 +296,7 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		if (crop_top + crop_height > f->known_height)
 			crop_height = f->known_height - crop_top;
 
-		obs_log(LOG_INFO, "[distroav] Crop applied: left=%d, top=%d, width=%u, height=%u", crop_left, crop_top,
+		obs_log(LOG_DEBUG, "[distroav] Crop applied: left=%d, top=%d, width=%u, height=%u", crop_left, crop_top,
 			crop_width, crop_height);
 
 		if (crop_width > 0 && crop_height > 0 && (crop_left > 0 || crop_top > 0 ||
