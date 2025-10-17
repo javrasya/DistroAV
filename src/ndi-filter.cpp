@@ -56,6 +56,9 @@ typedef struct {
 
 	// Video converter for custom resolution/FPS
 	ndi_video_converter_t converter;
+
+	// Stop transmission when inactive
+	bool stop_when_inactive;
 } ndi_filter_t;
 
 const char *ndi_filter_getname(void *)
@@ -83,6 +86,8 @@ obs_properties_t *ndi_filter_getproperties(void *)
 
 	obs_properties_add_text(props, FLT_PROP_GROUPS, obs_module_text("NDIPlugin.FilterProps.NDIGroups"),
 				OBS_TEXT_DEFAULT);
+
+	obs_properties_add_bool(props, "stop_when_inactive", "Stop transmission when inactive");
 
 	// Custom Resolution Settings
 	auto group_res = obs_properties_create();
@@ -182,6 +187,7 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_log(LOG_DEBUG, "+ndi_filter_getdefaults(...)");
 	obs_data_set_default_string(defaults, FLT_PROP_NAME, obs_module_text("NDIPlugin.FilterProps.NDIName.Default"));
 	obs_data_set_default_string(defaults, FLT_PROP_GROUPS, "");
+	obs_data_set_default_bool(defaults, "stop_when_inactive", true);
 
 	// Resolution defaults
 	obs_data_set_default_bool(defaults, "enable_custom_resolution", false);
@@ -222,11 +228,19 @@ bool is_filter_valid(ndi_filter_t *filter)
 	uint32_t width = obs_source_get_width(filter->obs_source);
 	uint32_t height = obs_source_get_height(filter->obs_source);
 
-	// Valid if parent width/height are nonzero, source is enabled, and parent is active
-	bool is_valid = (width != 0) && (height != 0) && obs_source_enabled(filter->obs_source) &&
-			obs_source_active(parent);
+	// Basic validity: dimensions exist and source is enabled
+	if ((width == 0) || (height == 0) || !obs_source_enabled(filter->obs_source)) {
+		return false;
+	}
 
-	return is_valid;
+	// If "stop when inactive" is disabled, always transmit
+	if (!filter->stop_when_inactive) {
+		return true;
+	}
+
+	// Check if parent (scene or source) is active
+	// obs_source_active() works for both scenes and sources automatically
+	return obs_source_active(parent);
 }
 
 void ndi_filter_raw_video(void *data, video_data *frame)
@@ -464,6 +478,9 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 	obs_log(LOG_DEBUG, "+ndi_filter_update(name='%s')", name);
 
 	ndi_sender_create(f, settings);
+
+	// Update stop when inactive setting
+	f->stop_when_inactive = obs_data_get_bool(settings, "stop_when_inactive");
 
 	// Update video converter settings
 	ndi_converter_update(&f->converter, settings);
