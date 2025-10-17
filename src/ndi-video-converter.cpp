@@ -145,6 +145,14 @@ void ndi_converter_update_crop_cache(ndi_video_converter_t *converter, uint32_t 
 
 	// If using percentage mode, convert percentages to pixel values based on source resolution
 	if (converter->crop_type == NDI_CROP_TYPE_PERCENTAGE && source_width > 0 && source_height > 0) {
+		// Check if percentage values represent "no crop" (0%, 0%, 100%, 100%)
+		if (converter->crop_left_pct == 0 && converter->crop_top_pct == 0 &&
+		    converter->crop_width_pct == 100 && converter->crop_height_pct == 100) {
+			// No crop needed with default percentage values
+			converter->crop_cache_valid = false;
+			return;
+		}
+
 		// Convert percentage values to pixels
 		crop_left = (int32_t)((float)converter->crop_left_pct / 100.0f * (float)source_width);
 		crop_top = (int32_t)((float)converter->crop_top_pct / 100.0f * (float)source_height);
