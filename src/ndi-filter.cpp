@@ -110,14 +110,26 @@ obs_properties_t *ndi_filter_getproperties(void *)
 	// Crop Settings (applied AFTER scaling)
 	auto group_crop = obs_properties_create();
 	obs_properties_add_bool(group_crop, "enable_crop", "Enable Crop");
+
+	obs_property_t *crop_type = obs_properties_add_list(group_crop, "crop_type", "Crop Type",
+							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(crop_type, "Pixel", NDI_CROP_TYPE_PIXEL);
+	obs_property_list_add_int(crop_type, "Percentage", NDI_CROP_TYPE_PERCENTAGE);
+
 	obs_properties_add_text(
 		group_crop, "crop_info",
-		"Coordinates in source resolution space (auto-scaled if custom resolution enabled). 0 = full dimension",
+		"Pixel: Absolute coordinates in source space. Percentage: Relative to source dimensions (0-100%).",
 		OBS_TEXT_INFO);
-	obs_properties_add_int(group_crop, "crop_left", "Left (source coords)", 0, 7680, 1);
-	obs_properties_add_int(group_crop, "crop_top", "Top (source coords)", 0, 4320, 1);
-	obs_properties_add_int(group_crop, "crop_width", "Width (0 = full)", 0, 7680, 1);
-	obs_properties_add_int(group_crop, "crop_height", "Height (0 = full)", 0, 4320, 1);
+
+	obs_properties_add_int(group_crop, "crop_left", "Left (pixels)", 0, 7680, 1);
+	obs_properties_add_int(group_crop, "crop_top", "Top (pixels)", 0, 4320, 1);
+	obs_properties_add_int(group_crop, "crop_width", "Width (pixels, 0 = full)", 0, 7680, 1);
+	obs_properties_add_int(group_crop, "crop_height", "Height (pixels, 0 = full)", 0, 4320, 1);
+
+	obs_properties_add_int(group_crop, "crop_left_pct", "Left (%)", 0, 100, 1);
+	obs_properties_add_int(group_crop, "crop_top_pct", "Top (%)", 0, 100, 1);
+	obs_properties_add_int(group_crop, "crop_width_pct", "Width (%)", 0, 100, 1);
+	obs_properties_add_int(group_crop, "crop_height_pct", "Height (%)", 0, 100, 1);
 
 	obs_properties_add_group(props, "group_crop", "Crop Region", OBS_GROUP_NORMAL, group_crop);
 
@@ -180,10 +192,15 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 
 	// Crop defaults (applied AFTER scaling)
 	obs_data_set_default_bool(defaults, "enable_crop", false);
+	obs_data_set_default_int(defaults, "crop_type", NDI_CROP_TYPE_PIXEL);
 	obs_data_set_default_int(defaults, "crop_left", 0);
 	obs_data_set_default_int(defaults, "crop_top", 0);
 	obs_data_set_default_int(defaults, "crop_width", 0);
 	obs_data_set_default_int(defaults, "crop_height", 0);
+	obs_data_set_default_int(defaults, "crop_left_pct", 0);
+	obs_data_set_default_int(defaults, "crop_top_pct", 0);
+	obs_data_set_default_int(defaults, "crop_width_pct", 100);
+	obs_data_set_default_int(defaults, "crop_height_pct", 100);
 
 	// Frame rate defaults
 	obs_data_set_default_bool(defaults, "enable_custom_framerate", false);

@@ -59,6 +59,12 @@ enum ndi_scale_type {
 	NDI_SCALE_BICUBIC              // Balanced (default), best quality
 };
 
+// Crop type mode
+enum ndi_crop_type {
+	NDI_CROP_TYPE_PIXEL = 0,      // Absolute pixel coordinates
+	NDI_CROP_TYPE_PERCENTAGE      // Percentage-based (0-100)
+};
+
 /**
  * Video converter state structure
  */
@@ -74,10 +80,15 @@ typedef struct {
 
 	// Crop settings
 	bool enable_crop;
+	enum ndi_crop_type crop_type;
 	int32_t crop_left;
 	int32_t crop_top;
 	uint32_t crop_width;
 	uint32_t crop_height;
+	int32_t crop_left_pct;
+	int32_t crop_top_pct;
+	int32_t crop_width_pct;
+	int32_t crop_height_pct;
 
 	// Frame rate settings
 	bool enable_custom_framerate;
