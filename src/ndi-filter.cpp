@@ -265,18 +265,23 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		ndi_fps_den = f->converter.target_fps_den;
 	}
 
-	// Apply crop (AFTER scaling) if enabled - use cached values for performance
+	// Apply CPU crop only when custom resolution is disabled
+	// When custom resolution is enabled, crop is applied on GPU during render (see ndi_filter_render_video)
 	uint32_t final_width = f->known_width;
 	uint32_t final_height = f->known_height;
 	uint8_t *final_data = frame->data[0];
 	uint32_t final_linesize = frame->linesize[0];
 
-	if (f->converter.enable_crop && f->converter.crop_cache_valid && frame && frame->data[0]) {
-		// Use pre-calculated cached crop values (avoids expensive per-frame calculation)
-		int32_t crop_left = f->converter.cached_crop_left;
-		int32_t crop_top = f->converter.cached_crop_top;
-		uint32_t crop_width = f->converter.cached_crop_width;
-		uint32_t crop_height = f->converter.cached_crop_height;
+	if (f->converter.enable_crop && !f->converter.enable_custom_resolution && 
+	    f->converter.crop_cache_valid && frame && frame->data[0]) {
+		// Use cached scaled-space crop values (for crop-only mode without scaling)
+		int32_t crop_left = f->converter.cached_crop_scaled_left;
+		int32_t crop_top = f->converter.cached_crop_scaled_top;
+		uint32_t crop_width = f->converter.cached_crop_scaled_width;
+		uint32_t crop_height = f->converter.cached_crop_scaled_height;
+
+		obs_log(LOG_INFO, "[distroav] CPU crop (no scaling): (%d,%d,%u,%u)", 
+			crop_left, crop_top, crop_width, crop_height);
 
 		if (crop_width > 0 && crop_height > 0 && (crop_left > 0 || crop_top > 0 ||
 							  crop_width < f->known_width ||
@@ -381,8 +386,32 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		vec4_zero(&background);
 
 		gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
-		// Ortho uses SOURCE dimensions - source fills render target, causing automatic scaling
-		gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+		
+		// Calculate orthographic projection coordinates
+		// If crop + custom resolution enabled: use source-space crop coords (crop-then-scale on GPU)
+		// Otherwise: use full source dimensions
+		float ortho_left = 0.0f;
+		float ortho_right = (float)width;
+		float ortho_top = 0.0f;
+		float ortho_bottom = (float)height;
+		
+		if (f->converter.enable_crop && f->converter.enable_custom_resolution && f->converter.crop_cache_valid) {
+			// Use cached source-space crop coordinates for GPU rendering
+			// This renders only the cropped region into the target resolution (crop before scale)
+			ortho_left = (float)f->converter.cached_crop_left;
+			ortho_right = (float)(f->converter.cached_crop_left + f->converter.cached_crop_width);
+			ortho_top = (float)f->converter.cached_crop_top;
+			ortho_bottom = (float)(f->converter.cached_crop_top + f->converter.cached_crop_height);
+			
+			obs_log(LOG_INFO, "[distroav] GPU crop+scale: crop source %ux%u region (%d,%d,%u,%u) -> render %ux%u",
+				width, height, f->converter.cached_crop_left, f->converter.cached_crop_top,
+				f->converter.cached_crop_width, f->converter.cached_crop_height,
+				render_width, render_height);
+		}
+		
+		// Ortho coordinates define which part of the source to render into the target
+		// This causes GPU to crop (if enabled) and scale in a single pass
+		gs_ortho(ortho_left, ortho_right, ortho_top, ortho_bottom, -100.0f, 100.0f);
 
 		gs_blend_state_push();
 		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);

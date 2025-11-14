@@ -113,11 +113,18 @@ typedef struct {
 	uint32_t source_height;
 	enum video_format source_format;
 
-	// Cached crop values (pre-scaled to avoid per-frame calculation)
+	// Cached crop values in source space (for GPU rendering - crop before scale)
 	int32_t cached_crop_left;
 	int32_t cached_crop_top;
 	uint32_t cached_crop_width;
 	uint32_t cached_crop_height;
+	
+	// Cached crop values in scaled space (for CPU - only when custom res disabled)
+	int32_t cached_crop_scaled_left;
+	int32_t cached_crop_scaled_top;
+	uint32_t cached_crop_scaled_width;
+	uint32_t cached_crop_scaled_height;
+	
 	bool crop_cache_valid;
 } ndi_video_converter_t;
 

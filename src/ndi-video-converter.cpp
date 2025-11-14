@@ -160,45 +160,72 @@ void ndi_converter_update_crop_cache(ndi_video_converter_t *converter, uint32_t 
 		crop_height = (uint32_t)((float)converter->crop_height_pct / 100.0f * (float)source_height);
 	}
 
-	// If custom resolution is enabled, normalize crop coordinates from source to scaled space
-	if (converter->enable_custom_resolution && converter->target_width > 0 && converter->target_height > 0 &&
-	    source_width > 0 && source_height > 0) {
-		// Calculate scaling ratios
-		float scale_x = (float)scaled_width / (float)source_width;
-		float scale_y = (float)scaled_height / (float)source_height;
-
-		// Scale crop coordinates proportionally
-		crop_left = (int32_t)((float)crop_left * scale_x);
-		crop_top = (int32_t)((float)crop_top * scale_y);
-		crop_width = (uint32_t)((float)crop_width * scale_x);
-		crop_height = (uint32_t)((float)crop_height * scale_y);
-	}
-
-	// 0 means use full dimension
+	// 0 means use full dimension (in source space)
 	if (crop_width == 0)
-		crop_width = scaled_width;
+		crop_width = source_width;
 	if (crop_height == 0)
-		crop_height = scaled_height;
+		crop_height = source_height;
 
-	// Clamp to valid range
+	// Clamp to valid range (source space)
 	if (crop_left < 0)
 		crop_left = 0;
 	if (crop_top < 0)
 		crop_top = 0;
-	if ((uint32_t)crop_left >= scaled_width)
-		crop_left = scaled_width - 1;
-	if ((uint32_t)crop_top >= scaled_height)
-		crop_top = scaled_height - 1;
-	if (crop_left + crop_width > scaled_width)
-		crop_width = scaled_width - crop_left;
-	if (crop_top + crop_height > scaled_height)
-		crop_height = scaled_height - crop_top;
+	if ((uint32_t)crop_left >= source_width)
+		crop_left = source_width - 1;
+	if ((uint32_t)crop_top >= source_height)
+		crop_top = source_height - 1;
+	if (crop_left + crop_width > source_width)
+		crop_width = source_width - crop_left;
+	if (crop_top + crop_height > source_height)
+		crop_height = source_height - crop_top;
 
-	// Store cached values
+	// Store cached values in SOURCE space (for GPU rendering - crop before scale)
 	converter->cached_crop_left = crop_left;
 	converter->cached_crop_top = crop_top;
 	converter->cached_crop_width = crop_width;
 	converter->cached_crop_height = crop_height;
+
+	// Calculate SCALED space coordinates (for CPU crop when custom resolution is disabled)
+	int32_t crop_scaled_left = crop_left;
+	int32_t crop_scaled_top = crop_top;
+	uint32_t crop_scaled_width = crop_width;
+	uint32_t crop_scaled_height = crop_height;
+	
+	// Only apply scaling if custom resolution is enabled
+	if (converter->enable_custom_resolution && converter->target_width > 0 && converter->target_height > 0 &&
+	    source_width > 0 && source_height > 0 && scaled_width != source_width && scaled_height != source_height) {
+		// Calculate scaling ratios
+		float scale_x = (float)scaled_width / (float)source_width;
+		float scale_y = (float)scaled_height / (float)source_height;
+
+		// Scale crop coordinates proportionally for CPU use
+		crop_scaled_left = (int32_t)((float)crop_left * scale_x);
+		crop_scaled_top = (int32_t)((float)crop_top * scale_y);
+		crop_scaled_width = (uint32_t)((float)crop_width * scale_x);
+		crop_scaled_height = (uint32_t)((float)crop_height * scale_y);
+		
+		// Clamp to scaled dimensions
+		if (crop_scaled_left < 0)
+			crop_scaled_left = 0;
+		if (crop_scaled_top < 0)
+			crop_scaled_top = 0;
+		if ((uint32_t)crop_scaled_left >= scaled_width)
+			crop_scaled_left = scaled_width - 1;
+		if ((uint32_t)crop_scaled_top >= scaled_height)
+			crop_scaled_top = scaled_height - 1;
+		if (crop_scaled_left + crop_scaled_width > scaled_width)
+			crop_scaled_width = scaled_width - crop_scaled_left;
+		if (crop_scaled_top + crop_scaled_height > scaled_height)
+			crop_scaled_height = scaled_height - crop_scaled_top;
+	}
+	
+	// Store scaled space values (for CPU when custom resolution disabled)
+	converter->cached_crop_scaled_left = crop_scaled_left;
+	converter->cached_crop_scaled_top = crop_scaled_top;
+	converter->cached_crop_scaled_width = crop_scaled_width;
+	converter->cached_crop_scaled_height = crop_scaled_height;
+	
 	converter->crop_cache_valid = true;
 }
 
