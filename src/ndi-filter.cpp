@@ -59,6 +59,12 @@ typedef struct {
 
 	// Stop transmission when inactive
 	bool stop_when_inactive;
+
+	// Low latency mode
+	bool low_latency;
+
+	// Enable audio streaming
+	bool enable_audio;
 } ndi_filter_t;
 
 const char *ndi_filter_getname(void *)
@@ -88,6 +94,10 @@ obs_properties_t *ndi_filter_getproperties(void *)
 				OBS_TEXT_DEFAULT);
 
 	obs_properties_add_bool(props, "stop_when_inactive", "Stop transmission when inactive");
+
+	obs_properties_add_bool(props, "enable_audio", "Enable Audio");
+
+	obs_properties_add_bool(props, "low_latency", "Lowest Latency (reduced buffering, may drop frames)");
 
 	// Custom Resolution Settings
 	auto group_res = obs_properties_create();
@@ -188,6 +198,8 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_data_set_default_string(defaults, FLT_PROP_NAME, obs_module_text("NDIPlugin.FilterProps.NDIName.Default"));
 	obs_data_set_default_string(defaults, FLT_PROP_GROUPS, "");
 	obs_data_set_default_bool(defaults, "stop_when_inactive", true);
+	obs_data_set_default_bool(defaults, "enable_audio", true);
+	obs_data_set_default_bool(defaults, "low_latency", false);
 
 	// Resolution defaults
 	obs_data_set_default_bool(defaults, "enable_custom_resolution", false);
@@ -247,9 +259,9 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 {
 	auto f = (ndi_filter_t *)data;
 
-	// Check frame rate limiting
+	// Check frame rate limiting (bypass in low-latency mode to avoid buffering)
 	int frames_to_send = 1;
-	if (f->converter.enable_custom_framerate && frame) {
+	if (!f->low_latency && f->converter.enable_custom_framerate && frame) {
 		bool should_send = ndi_converter_should_send_frame(&f->converter, frame->timestamp, &frames_to_send);
 		if (!should_send || frames_to_send == 0) {
 			return; // Skip this frame
@@ -259,7 +271,7 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 	// Determine frame rate metadata
 	uint32_t ndi_fps_num = f->ovi.fps_num;
 	uint32_t ndi_fps_den = f->ovi.fps_den;
-	if (f->converter.enable_custom_framerate && f->converter.target_fps_num > 0 &&
+	if (!f->low_latency && f->converter.enable_custom_framerate && f->converter.target_fps_num > 0 &&
 	    f->converter.target_fps_den > 0) {
 		ndi_fps_num = f->converter.target_fps_num;
 		ndi_fps_den = f->converter.target_fps_den;
@@ -280,7 +292,7 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		uint32_t crop_width = f->converter.cached_crop_scaled_width;
 		uint32_t crop_height = f->converter.cached_crop_scaled_height;
 
-		obs_log(LOG_INFO, "[distroav] CPU crop (no scaling): (%d,%d,%u,%u)", 
+		obs_log(LOG_DEBUG, "[distroav] CPU crop (no scaling): (%d,%d,%u,%u)", 
 			crop_left, crop_top, crop_width, crop_height);
 
 		if (crop_width > 0 && crop_height > 0 && (crop_left > 0 || crop_top > 0 ||
@@ -312,7 +324,13 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 		}
 
 		pthread_mutex_lock(&f->ndi_sender_video_mutex);
-		ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
+		if (f->low_latency) {
+			// Use async send to prevent blocking on network/receiver backpressure
+			ndiLib->send_send_video_async_v2(f->ndi_sender, &video_frame);
+		} else {
+			// Use synchronous send for backward compatibility
+			ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
+		}
 		pthread_mutex_unlock(&f->ndi_sender_video_mutex);
 	}
 }
@@ -333,7 +351,11 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		// Send empty frame to indicate invalid filter
 		NDIlib_video_frame_v2_t video_frame = {0};
 		pthread_mutex_lock(&f->ndi_sender_video_mutex);
-		ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
+		if (f->low_latency) {
+			ndiLib->send_send_video_async_v2(f->ndi_sender, &video_frame);
+		} else {
+			ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
+		}
 		pthread_mutex_unlock(&f->ndi_sender_video_mutex);
 		return;
 	}
@@ -359,7 +381,8 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		vi.height = render_height;
 		vi.fps_den = f->ovi.fps_den;
 		vi.fps_num = f->ovi.fps_num;
-		vi.cache_size = 16;
+		// Use smaller cache in low-latency mode to reduce buffering latency
+		vi.cache_size = f->low_latency ? 2 : 16;
 		vi.colorspace = VIDEO_CS_DEFAULT;
 		vi.range = VIDEO_RANGE_DEFAULT;
 		vi.name = obs_source_get_name(f->obs_source);
@@ -403,7 +426,7 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 			ortho_top = (float)f->converter.cached_crop_top;
 			ortho_bottom = (float)(f->converter.cached_crop_top + f->converter.cached_crop_height);
 			
-			obs_log(LOG_INFO, "[distroav] GPU crop+scale: crop source %ux%u region (%d,%d,%u,%u) -> render %ux%u",
+			obs_log(LOG_DEBUG, "[distroav] GPU crop+scale: crop source %ux%u region (%d,%d,%u,%u) -> render %ux%u",
 				width, height, f->converter.cached_crop_left, f->converter.cached_crop_top,
 				f->converter.cached_crop_width, f->converter.cached_crop_height,
 				render_width, render_height);
@@ -430,10 +453,16 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 			video_frame output_frame;
 			if (video_output_lock_frame(f->video_output, &output_frame, 1, os_gettime_ns())) {
 				uint32_t linesize = output_frame.linesize[0];
-				for (uint32_t i = 0; i < render_height; ++i) {
-					uint32_t dst_offset = linesize * i;
-					uint32_t src_offset = f->video_linesize * i;
-					memcpy(output_frame.data[0] + dst_offset, f->video_data + src_offset, linesize);
+				// Optimize: if linesizes match, copy entire frame at once
+				if (linesize == f->video_linesize) {
+					memcpy(output_frame.data[0], f->video_data, linesize * render_height);
+				} else {
+					// Fallback: copy line by line if linesizes differ
+					for (uint32_t i = 0; i < render_height; ++i) {
+						uint32_t dst_offset = linesize * i;
+						uint32_t src_offset = f->video_linesize * i;
+						memcpy(output_frame.data[0] + dst_offset, f->video_data + src_offset, linesize);
+					}
 				}
 
 				video_output_unlock_frame(f->video_output);
@@ -511,12 +540,19 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 	// Update stop when inactive setting
 	f->stop_when_inactive = obs_data_get_bool(settings, "stop_when_inactive");
 
+	// Update enable audio setting
+	f->enable_audio = obs_data_get_bool(settings, "enable_audio");
+
+	// Update low latency setting
+	f->low_latency = obs_data_get_bool(settings, "low_latency");
+
 	// Update video converter settings
 	ndi_converter_update(&f->converter, settings);
 
 	auto groups = obs_data_get_string(settings, FLT_PROP_GROUPS);
 
-	obs_log(LOG_INFO, "NDI Filter Updated: '%s'", name);
+	obs_log(LOG_INFO, "NDI Filter Updated: '%s' (enable_audio=%s, low_latency=%s)", name, 
+		f->enable_audio ? "true" : "false", f->low_latency ? "true" : "false");
 	obs_log(LOG_DEBUG, "-ndi_filter_update(name='%s', groups='%s')", name, groups);
 }
 
@@ -533,6 +569,11 @@ void *ndi_filter_create(obs_data_t *settings, obs_source_t *obs_source)
 	pthread_mutex_init(&f->ndi_sender_audio_mutex, NULL);
 	obs_get_video_info(&f->ovi);
 	obs_get_audio_info(&f->oai);
+
+	// Pre-allocate audio buffer to prevent runtime allocations
+	f->audio_conv_buffer_size = 16384;
+	f->audio_conv_buffer = (uint8_t *)bmalloc(f->audio_conv_buffer_size);
+	obs_log(LOG_DEBUG, "ndi_filter_create: pre-allocated %zu bytes for audio buffer", f->audio_conv_buffer_size);
 
 	// Initialize video converter
 	ndi_converter_init(&f->converter);
@@ -556,6 +597,11 @@ void *ndi_filter_create_audioonly(obs_data_t *settings, obs_source_t *obs_source
 	f->obs_source = obs_source;
 	pthread_mutex_init(&f->ndi_sender_audio_mutex, NULL);
 	obs_get_audio_info(&f->oai);
+
+	// Pre-allocate audio buffer to prevent runtime allocations
+	f->audio_conv_buffer_size = 16384;
+	f->audio_conv_buffer = (uint8_t *)bmalloc(f->audio_conv_buffer_size);
+	obs_log(LOG_DEBUG, "ndi_filter_create_audioonly: pre-allocated %zu bytes for audio buffer", f->audio_conv_buffer_size);
 
 	ndi_filter_update(f, settings);
 
@@ -637,6 +683,11 @@ obs_audio_data *ndi_filter_asyncaudio(void *data, obs_audio_data *audio_data)
 	// NOTE: The logic in this function should be similar to
 	// ndi-output.cpp/ndi_output_raw_audio(...)
 	auto f = (ndi_filter_t *)data;
+
+	// Skip audio processing if audio is disabled
+	if (!f->enable_audio) {
+		return audio_data;
+	}
 
 	obs_get_audio_info(&f->oai);
 
