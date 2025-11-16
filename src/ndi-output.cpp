@@ -329,7 +329,8 @@ void ndi_output_rawvideo(void *data, video_data *frame)
 	video_frame.frame_rate_N = o->video_framerate_num;
 	video_frame.frame_rate_D = o->video_framerate_den;
 	video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
-	video_frame.timecode = (int64_t)(frame->timestamp / 100);
+	// Use current wall-clock time as timecode (NDI expects absolute UTC epoch time)
+	video_frame.timecode = (int64_t)(os_gettime_ns() / 100);
 	video_frame.FourCC = o->frame_fourcc;
 
 	if (video_frame.FourCC == NDIlib_FourCC_type_UYVY) {
@@ -355,7 +356,8 @@ void ndi_output_rawaudio(void *data, audio_data *frame)
 	NDIlib_audio_frame_v3_t audio_frame = {0};
 	audio_frame.sample_rate = o->audio_samplerate;
 	audio_frame.no_channels = (int)o->audio_channels;
-	audio_frame.timecode = (int64_t)(frame->timestamp / 100);
+	// Use current wall-clock time as timecode (NDI expects absolute UTC epoch time)
+	audio_frame.timecode = (int64_t)(os_gettime_ns() / 100);
 	audio_frame.no_samples = frame->frames;
 	audio_frame.channel_stride_in_bytes = frame->frames * 4;
 	audio_frame.FourCC = NDIlib_FourCC_audio_type_FLTP;
