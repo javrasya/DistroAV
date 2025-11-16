@@ -85,10 +85,10 @@ typedef struct {
 	int32_t crop_top;
 	uint32_t crop_width;
 	uint32_t crop_height;
-	int32_t crop_left_pct;
-	int32_t crop_top_pct;
-	int32_t crop_width_pct;
-	int32_t crop_height_pct;
+	double crop_left_pct;
+	double crop_top_pct;
+	double crop_width_pct;
+	double crop_height_pct;
 
 	// Frame rate settings
 	bool enable_custom_framerate;

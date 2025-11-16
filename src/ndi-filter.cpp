@@ -141,10 +141,10 @@ obs_properties_t *ndi_filter_getproperties(void *)
 	obs_properties_add_int(group_crop, "crop_width", "Width (pixels, 0 = full)", 0, 7680, 1);
 	obs_properties_add_int(group_crop, "crop_height", "Height (pixels, 0 = full)", 0, 4320, 1);
 
-	obs_properties_add_int(group_crop, "crop_left_pct", "Left (%)", 0, 100, 1);
-	obs_properties_add_int(group_crop, "crop_top_pct", "Top (%)", 0, 100, 1);
-	obs_properties_add_int(group_crop, "crop_width_pct", "Width (%)", 0, 100, 1);
-	obs_properties_add_int(group_crop, "crop_height_pct", "Height (%)", 0, 100, 1);
+	obs_properties_add_float_slider(group_crop, "crop_left_pct", "Left (%)", 0.0, 100.0, 0.1);
+	obs_properties_add_float_slider(group_crop, "crop_top_pct", "Top (%)", 0.0, 100.0, 0.1);
+	obs_properties_add_float_slider(group_crop, "crop_width_pct", "Width (%)", 0.0, 100.0, 0.1);
+	obs_properties_add_float_slider(group_crop, "crop_height_pct", "Height (%)", 0.0, 100.0, 0.1);
 
 	obs_properties_add_group(props, "group_crop", "Crop Region", OBS_GROUP_NORMAL, group_crop);
 
@@ -215,10 +215,10 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_data_set_default_int(defaults, "crop_top", 0);
 	obs_data_set_default_int(defaults, "crop_width", 0);
 	obs_data_set_default_int(defaults, "crop_height", 0);
-	obs_data_set_default_int(defaults, "crop_left_pct", 0);
-	obs_data_set_default_int(defaults, "crop_top_pct", 0);
-	obs_data_set_default_int(defaults, "crop_width_pct", 100);
-	obs_data_set_default_int(defaults, "crop_height_pct", 100);
+	obs_data_set_default_double(defaults, "crop_left_pct", 0.0);
+	obs_data_set_default_double(defaults, "crop_top_pct", 0.0);
+	obs_data_set_default_double(defaults, "crop_width_pct", 100.0);
+	obs_data_set_default_double(defaults, "crop_height_pct", 100.0);
 
 	// Frame rate defaults
 	obs_data_set_default_bool(defaults, "enable_custom_framerate", false);
@@ -261,7 +261,7 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 
 	// Check frame rate limiting (bypass in low-latency mode to avoid buffering)
 	int frames_to_send = 1;
-	if (!f->low_latency && f->converter.enable_custom_framerate && frame) {
+	if (f->converter.enable_custom_framerate && frame) {
 		bool should_send = ndi_converter_should_send_frame(&f->converter, frame->timestamp, &frames_to_send);
 		if (!should_send || frames_to_send == 0) {
 			return; // Skip this frame
@@ -271,7 +271,7 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 	// Determine frame rate metadata
 	uint32_t ndi_fps_num = f->ovi.fps_num;
 	uint32_t ndi_fps_den = f->ovi.fps_den;
-	if (!f->low_latency && f->converter.enable_custom_framerate && f->converter.target_fps_num > 0 &&
+	if (f->converter.enable_custom_framerate && f->converter.target_fps_num > 0 &&
 	    f->converter.target_fps_den > 0) {
 		ndi_fps_num = f->converter.target_fps_num;
 		ndi_fps_den = f->converter.target_fps_den;

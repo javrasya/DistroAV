@@ -146,18 +146,18 @@ void ndi_converter_update_crop_cache(ndi_video_converter_t *converter, uint32_t 
 	// If using percentage mode, convert percentages to pixel values based on source resolution
 	if (converter->crop_type == NDI_CROP_TYPE_PERCENTAGE && source_width > 0 && source_height > 0) {
 		// Check if percentage values represent "no crop" (0%, 0%, 100%, 100%)
-		if (converter->crop_left_pct == 0 && converter->crop_top_pct == 0 &&
-		    converter->crop_width_pct == 100 && converter->crop_height_pct == 100) {
+		if (converter->crop_left_pct == 0.0 && converter->crop_top_pct == 0.0 &&
+		    converter->crop_width_pct == 100.0 && converter->crop_height_pct == 100.0) {
 			// No crop needed with default percentage values
 			converter->crop_cache_valid = false;
 			return;
 		}
 
 		// Convert percentage values to pixels
-		crop_left = (int32_t)((float)converter->crop_left_pct / 100.0f * (float)source_width);
-		crop_top = (int32_t)((float)converter->crop_top_pct / 100.0f * (float)source_height);
-		crop_width = (uint32_t)((float)converter->crop_width_pct / 100.0f * (float)source_width);
-		crop_height = (uint32_t)((float)converter->crop_height_pct / 100.0f * (float)source_height);
+		crop_left = (int32_t)((converter->crop_left_pct / 100.0) * (double)source_width);
+		crop_top = (int32_t)((converter->crop_top_pct / 100.0) * (double)source_height);
+		crop_width = (uint32_t)((converter->crop_width_pct / 100.0) * (double)source_width);
+		crop_height = (uint32_t)((converter->crop_height_pct / 100.0) * (double)source_height);
 	}
 
 	// 0 means use full dimension (in source space)
@@ -269,10 +269,10 @@ void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings
 	converter->crop_top = (int32_t)obs_data_get_int(settings, PROP_CROP_TOP);
 	converter->crop_width = (uint32_t)obs_data_get_int(settings, PROP_CROP_WIDTH);
 	converter->crop_height = (uint32_t)obs_data_get_int(settings, PROP_CROP_HEIGHT);
-	converter->crop_left_pct = (int32_t)obs_data_get_int(settings, PROP_CROP_LEFT_PCT);
-	converter->crop_top_pct = (int32_t)obs_data_get_int(settings, PROP_CROP_TOP_PCT);
-	converter->crop_width_pct = (int32_t)obs_data_get_int(settings, PROP_CROP_WIDTH_PCT);
-	converter->crop_height_pct = (int32_t)obs_data_get_int(settings, PROP_CROP_HEIGHT_PCT);
+	converter->crop_left_pct = obs_data_get_double(settings, PROP_CROP_LEFT_PCT);
+	converter->crop_top_pct = obs_data_get_double(settings, PROP_CROP_TOP_PCT);
+	converter->crop_width_pct = obs_data_get_double(settings, PROP_CROP_WIDTH_PCT);
+	converter->crop_height_pct = obs_data_get_double(settings, PROP_CROP_HEIGHT_PCT);
 
 	// Validate crop values (0 means use full dimensions, validated in render)
 	if (converter->crop_left < 0)
@@ -282,22 +282,22 @@ void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings
 	// Allow 0 for width/height (means use full dimensions)
 
 	// Validate percentage crop values (0-100 range)
-	if (converter->crop_left_pct < 0)
-		converter->crop_left_pct = 0;
-	if (converter->crop_left_pct > 100)
-		converter->crop_left_pct = 100;
-	if (converter->crop_top_pct < 0)
-		converter->crop_top_pct = 0;
-	if (converter->crop_top_pct > 100)
-		converter->crop_top_pct = 100;
-	if (converter->crop_width_pct < 0)
-		converter->crop_width_pct = 0;
-	if (converter->crop_width_pct > 100)
-		converter->crop_width_pct = 100;
-	if (converter->crop_height_pct < 0)
-		converter->crop_height_pct = 0;
-	if (converter->crop_height_pct > 100)
-		converter->crop_height_pct = 100;
+	if (converter->crop_left_pct < 0.0)
+		converter->crop_left_pct = 0.0;
+	if (converter->crop_left_pct > 100.0)
+		converter->crop_left_pct = 100.0;
+	if (converter->crop_top_pct < 0.0)
+		converter->crop_top_pct = 0.0;
+	if (converter->crop_top_pct > 100.0)
+		converter->crop_top_pct = 100.0;
+	if (converter->crop_width_pct < 0.0)
+		converter->crop_width_pct = 0.0;
+	if (converter->crop_width_pct > 100.0)
+		converter->crop_width_pct = 100.0;
+	if (converter->crop_height_pct < 0.0)
+		converter->crop_height_pct = 0.0;
+	if (converter->crop_height_pct > 100.0)
+		converter->crop_height_pct = 100.0;
 
 	// Invalidate crop cache when settings change
 	converter->crop_cache_valid = false;
