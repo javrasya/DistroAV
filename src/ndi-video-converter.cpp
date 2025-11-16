@@ -494,6 +494,11 @@ bool ndi_converter_should_send_frame(ndi_video_converter_t *converter, uint64_t 
 		converter->accumulator_ns -= converter->target_frame_interval_ns;
 	}
 
+	// Cap at 1 to prevent duplication (only allow frame dropping, not duplication)
+	if (count > 1) {
+		count = 1;
+	}
+
 	*frames_to_send = count;
 	return count > 0;
 }

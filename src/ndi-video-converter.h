@@ -182,11 +182,12 @@ bool ndi_converter_scale_video(ndi_video_converter_t *converter, uint8_t *frame_
 
 /**
  * Determine if a frame should be sent based on frame rate conversion.
- * Uses timestamp-based accumulator to handle any FPS conversion (up or down).
+ * Uses timestamp-based accumulator for downconversion (dropping frames).
+ * Never duplicates frames - output FPS is capped at source FPS.
  * @param converter The converter instance
  * @param frame_timestamp Timestamp of current frame in nanoseconds
- * @param frames_to_send Output: number of times to send this frame (for upconversion)
- * @return true if frame(s) should be sent, false if frame should be dropped
+ * @param frames_to_send Output: 1 if frame should be sent, 0 if dropped
+ * @return true if frame should be sent, false if frame should be dropped
  */
 bool ndi_converter_should_send_frame(ndi_video_converter_t *converter, uint64_t frame_timestamp,
 				     int *frames_to_send);
