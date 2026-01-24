@@ -44,7 +44,9 @@ typedef struct {
 	uint32_t known_height;
 
 	gs_texrender_t *texrender;
-	gs_stagesurf_t *stagesurface;
+	gs_stagesurf_t *stagesurface[2]; // Double-buffered staging surfaces
+	int current_surface;             // Index: 0 or 1
+	bool first_frame;                // Skip first frame (no previous data)
 	uint8_t *video_data;
 	uint32_t video_linesize;
 
@@ -372,8 +374,15 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 	}
 
 	if (f->known_width != render_width || f->known_height != render_height) {
-		gs_stagesurface_destroy(f->stagesurface);
-		f->stagesurface = gs_stagesurface_create(render_width, render_height, TEXFORMAT);
+		// Destroy both staging surfaces
+		gs_stagesurface_destroy(f->stagesurface[0]);
+		gs_stagesurface_destroy(f->stagesurface[1]);
+		// Create double-buffered staging surfaces
+		f->stagesurface[0] = gs_stagesurface_create(render_width, render_height, TEXFORMAT);
+		f->stagesurface[1] = gs_stagesurface_create(render_width, render_height, TEXFORMAT);
+		// Reset double-buffer state when surfaces are recreated
+		f->current_surface = 0;
+		f->first_frame = true;
 
 		video_output_info vi = {0};
 		vi.format = VIDEO_FORMAT_BGRA;
@@ -382,7 +391,8 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		vi.fps_den = f->ovi.fps_den;
 		vi.fps_num = f->ovi.fps_num;
 		// Use smaller cache in low-latency mode to reduce buffering latency
-		vi.cache_size = f->low_latency ? 2 : 16;
+		// 4 frames provides better headroom for multiple filters competing for buffers
+		vi.cache_size = f->low_latency ? 4 : 16;
 		vi.colorspace = VIDEO_CS_DEFAULT;
 		vi.range = VIDEO_RANGE_DEFAULT;
 		vi.name = obs_source_get_name(f->obs_source);
@@ -448,28 +458,40 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		gs_blend_state_pop();
 		gs_texrender_end(f->texrender);
 
-		gs_stage_texture(f->stagesurface, gs_texrender_get_texture(f->texrender));
-		if (gs_stagesurface_map(f->stagesurface, &f->video_data, &f->video_linesize)) {
-			video_frame output_frame;
-			if (video_output_lock_frame(f->video_output, &output_frame, 1, os_gettime_ns())) {
-				uint32_t linesize = output_frame.linesize[0];
-				// Optimize: if linesizes match, copy entire frame at once
-				if (linesize == f->video_linesize) {
-					memcpy(output_frame.data[0], f->video_data, linesize * render_height);
-				} else {
-					// Fallback: copy line by line if linesizes differ
-					for (uint32_t i = 0; i < render_height; ++i) {
-						uint32_t dst_offset = linesize * i;
-						uint32_t src_offset = f->video_linesize * i;
-						memcpy(output_frame.data[0] + dst_offset, f->video_data + src_offset, linesize);
+		// Double-buffered staging: Stage current frame (non-blocking GPU operation)
+		gs_stage_texture(f->stagesurface[f->current_surface], gs_texrender_get_texture(f->texrender));
+
+		// Read PREVIOUS frame's data (GPU has already completed this one)
+		// This hides GPU latency - we never wait for the current frame's readback
+		if (!f->first_frame) {
+			int prev_surface = 1 - f->current_surface;
+			if (gs_stagesurface_map(f->stagesurface[prev_surface], &f->video_data, &f->video_linesize)) {
+				video_frame output_frame;
+				if (video_output_lock_frame(f->video_output, &output_frame, 1, os_gettime_ns())) {
+					uint32_t linesize = output_frame.linesize[0];
+					// Optimize: if linesizes match, copy entire frame at once
+					if (linesize == f->video_linesize) {
+						memcpy(output_frame.data[0], f->video_data, linesize * render_height);
+					} else {
+						// Fallback: copy line by line if linesizes differ
+						for (uint32_t i = 0; i < render_height; ++i) {
+							uint32_t dst_offset = linesize * i;
+							uint32_t src_offset = f->video_linesize * i;
+							memcpy(output_frame.data[0] + dst_offset, f->video_data + src_offset,
+							       linesize);
+						}
 					}
+
+					video_output_unlock_frame(f->video_output);
 				}
 
-				video_output_unlock_frame(f->video_output);
+				gs_stagesurface_unmap(f->stagesurface[prev_surface]);
 			}
-
-			gs_stagesurface_unmap(f->stagesurface);
 		}
+
+		// Swap surfaces for next frame
+		f->current_surface = 1 - f->current_surface;
+		f->first_frame = false;
 	}
 }
 
@@ -565,6 +587,9 @@ void *ndi_filter_create(obs_data_t *settings, obs_source_t *obs_source)
 	auto f = (ndi_filter_t *)bzalloc(sizeof(ndi_filter_t));
 	f->obs_source = obs_source;
 	f->texrender = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
+	// Initialize double-buffer state (surfaces created on first render)
+	f->current_surface = 0;
+	f->first_frame = true;
 	pthread_mutex_init(&f->ndi_sender_video_mutex, NULL);
 	pthread_mutex_init(&f->ndi_sender_audio_mutex, NULL);
 	obs_get_video_info(&f->ovi);
@@ -625,8 +650,11 @@ void ndi_filter_destroy(void *data)
 	pthread_mutex_unlock(&f->ndi_sender_audio_mutex);
 	pthread_mutex_unlock(&f->ndi_sender_video_mutex);
 
-	gs_stagesurface_unmap(f->stagesurface);
-	gs_stagesurface_destroy(f->stagesurface);
+	// Destroy both double-buffered staging surfaces
+	gs_stagesurface_unmap(f->stagesurface[0]);
+	gs_stagesurface_unmap(f->stagesurface[1]);
+	gs_stagesurface_destroy(f->stagesurface[0]);
+	gs_stagesurface_destroy(f->stagesurface[1]);
 	gs_texrender_destroy(f->texrender);
 
 	if (f->audio_conv_buffer) {
