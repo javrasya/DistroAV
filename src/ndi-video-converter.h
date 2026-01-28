@@ -18,7 +18,6 @@
 #pragma once
 
 #include <obs-module.h>
-#include <media-io/video-scaler.h>
 #include <util/platform.h>
 
 /**
@@ -98,11 +97,6 @@ typedef struct {
 	uint32_t target_fps_num;
 	uint32_t target_fps_den;
 
-	// Conversion state
-	video_scaler_t *scaler;
-	uint8_t *scaled_buffer;
-	size_t scaled_buffer_size;
-
 	// Frame rate conversion state
 	int64_t accumulator_ns;
 	int64_t target_frame_interval_ns;
@@ -154,33 +148,6 @@ void ndi_converter_update_crop_cache(ndi_video_converter_t *converter, uint32_t 
 				     uint32_t scaled_width, uint32_t scaled_height);
 
 /**
- * Check if resolution scaling is needed and update scaler if necessary.
- * @param converter The converter instance
- * @param source_width Current source width
- * @param source_height Current source height
- * @param source_format Current source video format
- * @return true if scaling is needed and ready, false otherwise
- */
-bool ndi_converter_update_scaler(ndi_video_converter_t *converter, uint32_t source_width, uint32_t source_height,
-				  enum video_format source_format);
-
-/**
- * Scale video frame to target resolution.
- * @param converter The converter instance
- * @param frame_in Input frame data
- * @param linesize_in Input frame line sizes
- * @param source_width Source width
- * @param source_height Source height
- * @param source_format Source video format
- * @param frame_out Output scaled frame data pointer (will point to scaled buffer)
- * @param linesize_out Output line size pointer
- * @return true on success, false on failure
- */
-bool ndi_converter_scale_video(ndi_video_converter_t *converter, uint8_t *frame_in[], uint32_t linesize_in[],
-			       uint32_t source_width, uint32_t source_height, enum video_format source_format,
-			       uint8_t **frame_out, uint32_t *linesize_out);
-
-/**
  * Determine if a frame should be sent based on frame rate conversion.
  * Uses timestamp-based accumulator for downconversion (dropping frames).
  * Never duplicates frames - output FPS is capped at source FPS.
@@ -191,6 +158,15 @@ bool ndi_converter_scale_video(ndi_video_converter_t *converter, uint8_t *frame_
  */
 bool ndi_converter_should_send_frame(ndi_video_converter_t *converter, uint64_t frame_timestamp,
 				     int *frames_to_send);
+
+/**
+ * Peek to check if a frame would be sent, WITHOUT mutating accumulator state.
+ * Use this BEFORE GPU rendering to skip frames that would be dropped anyway.
+ * @param converter The converter instance
+ * @param frame_timestamp Timestamp of current frame in nanoseconds
+ * @return true if frame would be sent, false if it would be dropped
+ */
+bool ndi_converter_should_render_frame_peek(ndi_video_converter_t *converter, uint64_t frame_timestamp);
 
 /**
  * Destroy and free converter resources.

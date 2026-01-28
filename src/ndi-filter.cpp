@@ -44,13 +44,10 @@ typedef struct {
 	uint32_t known_height;
 
 	gs_texrender_t *texrender;
-	gs_stagesurf_t *stagesurface[2]; // Double-buffered staging surfaces
-	int current_surface;             // Index: 0 or 1
-	bool first_frame;                // Skip first frame (no previous data)
+	gs_stagesurf_t *stagesurface; // Single staging surface (lowest latency)
 	uint8_t *video_data;
 	uint32_t video_linesize;
 
-	video_t *video_output;
 	bool is_audioonly;
 
 	uint8_t *audio_conv_buffer;
@@ -61,9 +58,6 @@ typedef struct {
 
 	// Stop transmission when inactive
 	bool stop_when_inactive;
-
-	// Low latency mode
-	bool low_latency;
 
 	// Enable audio streaming
 	bool enable_audio;
@@ -98,8 +92,6 @@ obs_properties_t *ndi_filter_getproperties(void *)
 	obs_properties_add_bool(props, "stop_when_inactive", "Stop transmission when inactive");
 
 	obs_properties_add_bool(props, "enable_audio", "Enable Audio");
-
-	obs_properties_add_bool(props, "low_latency", "Lowest Latency (reduced buffering, may drop frames)");
 
 	// Custom Resolution Settings
 	auto group_res = obs_properties_create();
@@ -201,7 +193,6 @@ void ndi_filter_getdefaults(obs_data_t *defaults)
 	obs_data_set_default_string(defaults, FLT_PROP_GROUPS, "");
 	obs_data_set_default_bool(defaults, "stop_when_inactive", true);
 	obs_data_set_default_bool(defaults, "enable_audio", true);
-	obs_data_set_default_bool(defaults, "low_latency", false);
 
 	// Resolution defaults
 	obs_data_set_default_bool(defaults, "enable_custom_resolution", false);
@@ -257,14 +248,14 @@ bool is_filter_valid(ndi_filter_t *filter)
 	return obs_source_active(parent);
 }
 
-void ndi_filter_raw_video(void *data, video_data *frame)
+// Helper function to send video frame directly to NDI (bypasses video_output)
+static void ndi_filter_send_video_frame(ndi_filter_t *f, uint8_t *data, uint32_t linesize, uint32_t width,
+					uint32_t height, uint64_t timestamp)
 {
-	auto f = (ndi_filter_t *)data;
-
-	// Check frame rate limiting (bypass in low-latency mode to avoid buffering)
+	// Update FPS accumulator and check if we should send
 	int frames_to_send = 1;
-	if (f->converter.enable_custom_framerate && frame) {
-		bool should_send = ndi_converter_should_send_frame(&f->converter, frame->timestamp, &frames_to_send);
+	if (f->converter.enable_custom_framerate) {
+		bool should_send = ndi_converter_should_send_frame(&f->converter, timestamp, &frames_to_send);
 		if (!should_send || frames_to_send == 0) {
 			return; // Skip this frame
 		}
@@ -280,61 +271,52 @@ void ndi_filter_raw_video(void *data, video_data *frame)
 	}
 
 	// Apply CPU crop only when custom resolution is disabled
-	// When custom resolution is enabled, crop is applied on GPU during render (see ndi_filter_render_video)
-	uint32_t final_width = f->known_width;
-	uint32_t final_height = f->known_height;
-	uint8_t *final_data = frame->data[0];
-	uint32_t final_linesize = frame->linesize[0];
+	// When custom resolution is enabled, crop is applied on GPU during render
+	uint32_t final_width = width;
+	uint32_t final_height = height;
+	uint8_t *final_data = data;
+	uint32_t final_linesize = linesize;
 
-	if (f->converter.enable_crop && !f->converter.enable_custom_resolution && 
-	    f->converter.crop_cache_valid && frame && frame->data[0]) {
+	if (f->converter.enable_crop && !f->converter.enable_custom_resolution && f->converter.crop_cache_valid &&
+	    data) {
 		// Use cached scaled-space crop values (for crop-only mode without scaling)
 		int32_t crop_left = f->converter.cached_crop_scaled_left;
 		int32_t crop_top = f->converter.cached_crop_scaled_top;
 		uint32_t crop_width = f->converter.cached_crop_scaled_width;
 		uint32_t crop_height = f->converter.cached_crop_scaled_height;
 
-		obs_log(LOG_DEBUG, "[distroav] CPU crop (no scaling): (%d,%d,%u,%u)", 
-			crop_left, crop_top, crop_width, crop_height);
+#ifdef DISTROAV_DEBUG_FRAME_PATH
+		obs_log(LOG_DEBUG, "[distroav] CPU crop (no scaling): (%d,%d,%u,%u)", crop_left, crop_top, crop_width,
+			crop_height);
+#endif
 
-		if (crop_width > 0 && crop_height > 0 && (crop_left > 0 || crop_top > 0 ||
-							  crop_width < f->known_width ||
-							  crop_height < f->known_height)) {
+		if (crop_width > 0 && crop_height > 0 &&
+		    (crop_left > 0 || crop_top > 0 || crop_width < width || crop_height < height)) {
 			// Offset pointer to crop region (BGRA = 4 bytes per pixel)
-			final_data = frame->data[0] + (crop_top * final_linesize) + (crop_left * 4);
+			final_data = data + (crop_top * final_linesize) + (crop_left * 4);
 			final_width = crop_width;
 			final_height = crop_height;
 			// linesize stays the same (full row stride)
 		}
 	}
 
-	// Send frame(s) - dimensions may be cropped from scaled frame
-	for (int i = 0; i < frames_to_send; i++) {
-		NDIlib_video_frame_v2_t video_frame = {0};
+	// Build NDI frame
+	NDIlib_video_frame_v2_t video_frame = {0};
+	video_frame.xres = final_width;
+	video_frame.yres = final_height;
+	video_frame.FourCC = NDIlib_FourCC_type_BGRA;
+	video_frame.frame_rate_N = ndi_fps_num;
+	video_frame.frame_rate_D = ndi_fps_den;
+	video_frame.picture_aspect_ratio = 0;
+	video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
+	video_frame.timecode = NDIlib_send_timecode_synthesize;
+	video_frame.p_data = final_data;
+	video_frame.line_stride_in_bytes = final_linesize;
 
-		if (frame && frame->data[0]) {
-			video_frame.xres = final_width;
-			video_frame.yres = final_height;
-			video_frame.FourCC = NDIlib_FourCC_type_BGRA;
-			video_frame.frame_rate_N = ndi_fps_num;
-			video_frame.frame_rate_D = ndi_fps_den;
-			video_frame.picture_aspect_ratio = 0;
-			video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
-			video_frame.timecode = NDIlib_send_timecode_synthesize;
-			video_frame.p_data = final_data;
-			video_frame.line_stride_in_bytes = final_linesize;
-		}
-
-		pthread_mutex_lock(&f->ndi_sender_video_mutex);
-		if (f->low_latency) {
-			// Use async send to prevent blocking on network/receiver backpressure
-			ndiLib->send_send_video_async_v2(f->ndi_sender, &video_frame);
-		} else {
-			// Use synchronous send for backward compatibility
-			ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
-		}
-		pthread_mutex_unlock(&f->ndi_sender_video_mutex);
-	}
+	// Send directly to NDI (async for lowest latency)
+	pthread_mutex_lock(&f->ndi_sender_video_mutex);
+	ndiLib->send_send_video_async_v2(f->ndi_sender, &video_frame);
+	pthread_mutex_unlock(&f->ndi_sender_video_mutex);
 }
 
 void ndi_filter_render_video(void *data, gs_effect_t *)
@@ -353,13 +335,21 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		// Send empty frame to indicate invalid filter
 		NDIlib_video_frame_v2_t video_frame = {0};
 		pthread_mutex_lock(&f->ndi_sender_video_mutex);
-		if (f->low_latency) {
-			ndiLib->send_send_video_async_v2(f->ndi_sender, &video_frame);
-		} else {
-			ndiLib->send_send_video_v2(f->ndi_sender, &video_frame);
-		}
+		ndiLib->send_send_video_async_v2(f->ndi_sender, &video_frame);
 		pthread_mutex_unlock(&f->ndi_sender_video_mutex);
 		return;
+	}
+
+	// OPTIMIZATION: Skip ALL GPU work when no receivers are connected
+	if (f->ndi_sender && ndiLib->send_get_no_connections(f->ndi_sender, 0) == 0) {
+		return; // No receivers, skip GPU work entirely
+	}
+
+	// OPTIMIZATION: Early FPS gating - skip GPU work for frames that will be dropped
+	uint64_t frame_timestamp = os_gettime_ns();
+	if (f->converter.enable_custom_framerate &&
+	    !ndi_converter_should_render_frame_peek(&f->converter, frame_timestamp)) {
+		return; // Frame would be dropped by FPS gating, skip GPU work
 	}
 
 	uint32_t width = obs_source_get_width(f->obs_source);
@@ -374,32 +364,9 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 	}
 
 	if (f->known_width != render_width || f->known_height != render_height) {
-		// Destroy both staging surfaces
-		gs_stagesurface_destroy(f->stagesurface[0]);
-		gs_stagesurface_destroy(f->stagesurface[1]);
-		// Create double-buffered staging surfaces
-		f->stagesurface[0] = gs_stagesurface_create(render_width, render_height, TEXFORMAT);
-		f->stagesurface[1] = gs_stagesurface_create(render_width, render_height, TEXFORMAT);
-		// Reset double-buffer state when surfaces are recreated
-		f->current_surface = 0;
-		f->first_frame = true;
-
-		video_output_info vi = {0};
-		vi.format = VIDEO_FORMAT_BGRA;
-		vi.width = render_width;
-		vi.height = render_height;
-		vi.fps_den = f->ovi.fps_den;
-		vi.fps_num = f->ovi.fps_num;
-		// Use smaller cache in low-latency mode to reduce buffering latency
-		// 4 frames provides better headroom for multiple filters competing for buffers
-		vi.cache_size = f->low_latency ? 4 : 16;
-		vi.colorspace = VIDEO_CS_DEFAULT;
-		vi.range = VIDEO_RANGE_DEFAULT;
-		vi.name = obs_source_get_name(f->obs_source);
-
-		video_output_close(f->video_output);
-		video_output_open(&f->video_output, &vi);
-		video_output_connect(f->video_output, nullptr, ndi_filter_raw_video, f);
+		// Destroy and recreate staging surface
+		gs_stagesurface_destroy(f->stagesurface);
+		f->stagesurface = gs_stagesurface_create(render_width, render_height, TEXFORMAT);
 
 		f->known_width = render_width;
 		f->known_height = render_height;
@@ -413,13 +380,13 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 
 	gs_texrender_reset(f->texrender);
 
-	// Render at target resolution (GPU scaling happens here - this is the key!)
+	// Render at target resolution (GPU scaling happens here)
 	if (gs_texrender_begin(f->texrender, render_width, render_height)) {
 		vec4 background;
 		vec4_zero(&background);
 
 		gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
-		
+
 		// Calculate orthographic projection coordinates
 		// If crop + custom resolution enabled: use source-space crop coords (crop-then-scale on GPU)
 		// Otherwise: use full source dimensions
@@ -427,7 +394,7 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		float ortho_right = (float)width;
 		float ortho_top = 0.0f;
 		float ortho_bottom = (float)height;
-		
+
 		if (f->converter.enable_crop && f->converter.enable_custom_resolution && f->converter.crop_cache_valid) {
 			// Use cached source-space crop coordinates for GPU rendering
 			// This renders only the cropped region into the target resolution (crop before scale)
@@ -435,13 +402,16 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 			ortho_right = (float)(f->converter.cached_crop_left + f->converter.cached_crop_width);
 			ortho_top = (float)f->converter.cached_crop_top;
 			ortho_bottom = (float)(f->converter.cached_crop_top + f->converter.cached_crop_height);
-			
-			obs_log(LOG_DEBUG, "[distroav] GPU crop+scale: crop source %ux%u region (%d,%d,%u,%u) -> render %ux%u",
+
+#ifdef DISTROAV_DEBUG_FRAME_PATH
+			obs_log(LOG_DEBUG,
+				"[distroav] GPU crop+scale: crop source %ux%u region (%d,%d,%u,%u) -> render %ux%u",
 				width, height, f->converter.cached_crop_left, f->converter.cached_crop_top,
-				f->converter.cached_crop_width, f->converter.cached_crop_height,
-				render_width, render_height);
+				f->converter.cached_crop_width, f->converter.cached_crop_height, render_width,
+				render_height);
+#endif
 		}
-		
+
 		// Ortho coordinates define which part of the source to render into the target
 		// This causes GPU to crop (if enabled) and scale in a single pass
 		gs_ortho(ortho_left, ortho_right, ortho_top, ortho_bottom, -100.0f, 100.0f);
@@ -458,40 +428,16 @@ void ndi_filter_render_video(void *data, gs_effect_t *)
 		gs_blend_state_pop();
 		gs_texrender_end(f->texrender);
 
-		// Double-buffered staging: Stage current frame (non-blocking GPU operation)
-		gs_stage_texture(f->stagesurface[f->current_surface], gs_texrender_get_texture(f->texrender));
+		// Single-buffer staging: Stage and read same surface immediately
+		// This minimizes latency at the cost of potential GPU stalls
+		gs_stage_texture(f->stagesurface, gs_texrender_get_texture(f->texrender));
 
-		// Read PREVIOUS frame's data (GPU has already completed this one)
-		// This hides GPU latency - we never wait for the current frame's readback
-		if (!f->first_frame) {
-			int prev_surface = 1 - f->current_surface;
-			if (gs_stagesurface_map(f->stagesurface[prev_surface], &f->video_data, &f->video_linesize)) {
-				video_frame output_frame;
-				if (video_output_lock_frame(f->video_output, &output_frame, 1, os_gettime_ns())) {
-					uint32_t linesize = output_frame.linesize[0];
-					// Optimize: if linesizes match, copy entire frame at once
-					if (linesize == f->video_linesize) {
-						memcpy(output_frame.data[0], f->video_data, linesize * render_height);
-					} else {
-						// Fallback: copy line by line if linesizes differ
-						for (uint32_t i = 0; i < render_height; ++i) {
-							uint32_t dst_offset = linesize * i;
-							uint32_t src_offset = f->video_linesize * i;
-							memcpy(output_frame.data[0] + dst_offset, f->video_data + src_offset,
-							       linesize);
-						}
-					}
-
-					video_output_unlock_frame(f->video_output);
-				}
-
-				gs_stagesurface_unmap(f->stagesurface[prev_surface]);
-			}
+		if (gs_stagesurface_map(f->stagesurface, &f->video_data, &f->video_linesize)) {
+			// Send directly to NDI (bypasses video_output intermediary)
+			ndi_filter_send_video_frame(f, f->video_data, f->video_linesize, render_width, render_height,
+						    frame_timestamp);
+			gs_stagesurface_unmap(f->stagesurface);
 		}
-
-		// Swap surfaces for next frame
-		f->current_surface = 1 - f->current_surface;
-		f->first_frame = false;
 	}
 }
 
@@ -565,16 +511,12 @@ void ndi_filter_update(void *data, obs_data_t *settings)
 	// Update enable audio setting
 	f->enable_audio = obs_data_get_bool(settings, "enable_audio");
 
-	// Update low latency setting
-	f->low_latency = obs_data_get_bool(settings, "low_latency");
-
 	// Update video converter settings
 	ndi_converter_update(&f->converter, settings);
 
 	auto groups = obs_data_get_string(settings, FLT_PROP_GROUPS);
 
-	obs_log(LOG_INFO, "NDI Filter Updated: '%s' (enable_audio=%s, low_latency=%s)", name, 
-		f->enable_audio ? "true" : "false", f->low_latency ? "true" : "false");
+	obs_log(LOG_INFO, "NDI Filter Updated: '%s' (enable_audio=%s)", name, f->enable_audio ? "true" : "false");
 	obs_log(LOG_DEBUG, "-ndi_filter_update(name='%s', groups='%s')", name, groups);
 }
 
@@ -587,9 +529,7 @@ void *ndi_filter_create(obs_data_t *settings, obs_source_t *obs_source)
 	auto f = (ndi_filter_t *)bzalloc(sizeof(ndi_filter_t));
 	f->obs_source = obs_source;
 	f->texrender = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
-	// Initialize double-buffer state (surfaces created on first render)
-	f->current_surface = 0;
-	f->first_frame = true;
+	// Single staging surface created on first render when dimensions are known
 	pthread_mutex_init(&f->ndi_sender_video_mutex, NULL);
 	pthread_mutex_init(&f->ndi_sender_audio_mutex, NULL);
 	obs_get_video_info(&f->ovi);
@@ -642,19 +582,15 @@ void ndi_filter_destroy(void *data)
 	auto name = obs_source_get_name(f->obs_source);
 	obs_log(LOG_DEBUG, "+ndi_filter_destroy('%s'...)", name);
 
-	video_output_close(f->video_output);
-
 	pthread_mutex_lock(&f->ndi_sender_video_mutex);
 	pthread_mutex_lock(&f->ndi_sender_audio_mutex);
 	ndiLib->send_destroy(f->ndi_sender);
 	pthread_mutex_unlock(&f->ndi_sender_audio_mutex);
 	pthread_mutex_unlock(&f->ndi_sender_video_mutex);
 
-	// Destroy both double-buffered staging surfaces
-	gs_stagesurface_unmap(f->stagesurface[0]);
-	gs_stagesurface_unmap(f->stagesurface[1]);
-	gs_stagesurface_destroy(f->stagesurface[0]);
-	gs_stagesurface_destroy(f->stagesurface[1]);
+	// Destroy single staging surface
+	gs_stagesurface_unmap(f->stagesurface);
+	gs_stagesurface_destroy(f->stagesurface);
 	gs_texrender_destroy(f->texrender);
 
 	if (f->audio_conv_buffer) {

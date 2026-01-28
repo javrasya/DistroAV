@@ -35,6 +35,17 @@ See [Installation Wiki](https://github.com/DistroAV/DistroAV/wiki/1.-Installatio
 
 See [Troubleshooting Wiki](https://github.com/DistroAV/DistroAV/wiki/2.-Troubleshooting)
 
+### Error-401: NDI® Runtime Not Found
+
+If you see this error, the NDI Runtime is not installed on your system. DistroAV requires the NDI Runtime to function.
+
+**Solution:** Download and install the NDI Runtime from http://ndi.link/NDIRedistV6
+
+**Common causes:**
+- NDI Runtime was never installed
+- NDI Runtime was uninstalled or removed by cleanup tools
+- Antivirus software blocked/quarantined NDI DLLs
+
 Conflict with OBS-NDI plugin : [Follow the instructions](https://github.com/DistroAV/DistroAV/wiki/OBS%E2%80%90NDI-Is-Now-DistroAV)
 
 # Development

@@ -16,7 +16,6 @@
 ******************************************************************************/
 
 #include "ndi-video-converter.h"
-#include <util/bmem.h>
 #include <cstring>
 
 // Property names
@@ -342,130 +341,23 @@ void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings
 	}
 }
 
-bool ndi_converter_update_scaler(ndi_video_converter_t *converter, uint32_t source_width, uint32_t source_height,
-				  enum video_format source_format)
+bool ndi_converter_should_render_frame_peek(ndi_video_converter_t *converter, uint64_t frame_timestamp)
 {
-	if (!converter->enable_custom_resolution || converter->target_width == 0 || converter->target_height == 0) {
-		blog(LOG_DEBUG, "[ndi-converter] Scaling disabled or no target dimensions");
-		return false;
+	if (!converter->enable_custom_framerate || converter->target_frame_interval_ns == 0) {
+		return true; // No FPS conversion, render every frame
 	}
 
-	// Check if we need to recreate the scaler
-	bool need_recreate =
-		!converter->scaler || converter->source_width != source_width ||
-		converter->source_height != source_height || converter->source_format != source_format;
-
-	if (!need_recreate) {
-		blog(LOG_DEBUG, "[ndi-converter] Scaler already exists, reusing");
+	// First frame should always be rendered
+	if (converter->last_frame_timestamp == 0) {
 		return true;
 	}
 
-	blog(LOG_INFO, "[ndi-converter] Creating scaler: %dx%d -> %dx%d", source_width, source_height,
-	     converter->target_width, converter->target_height);
+	// Calculate elapsed time since last frame (peek without mutating)
+	int64_t delta_ns = (int64_t)(frame_timestamp - converter->last_frame_timestamp);
 
-	// Destroy old scaler
-	if (converter->scaler) {
-		video_scaler_destroy(converter->scaler);
-		converter->scaler = nullptr;
-	}
-
-	// Create new scaler
-	struct video_scale_info src_info = {};
-	src_info.format = source_format;
-	src_info.width = source_width;
-	src_info.height = source_height;
-	src_info.range = VIDEO_RANGE_DEFAULT;
-	src_info.colorspace = VIDEO_CS_DEFAULT;
-
-	struct video_scale_info dst_info = {};
-	dst_info.format = VIDEO_FORMAT_BGRA; // NDI Filter uses BGRA
-	dst_info.width = converter->target_width;
-	dst_info.height = converter->target_height;
-	dst_info.range = VIDEO_RANGE_DEFAULT;
-	dst_info.colorspace = VIDEO_CS_DEFAULT;
-
-	// Map our scale type to OBS scale type
-	enum video_scale_type obs_scale_type;
-	switch (converter->scale_type) {
-	case NDI_SCALE_FAST_BILINEAR:
-		obs_scale_type = VIDEO_SCALE_FAST_BILINEAR;
-		break;
-	case NDI_SCALE_BILINEAR:
-		obs_scale_type = VIDEO_SCALE_BILINEAR;
-		break;
-	case NDI_SCALE_BICUBIC:
-		obs_scale_type = VIDEO_SCALE_BICUBIC;
-		break;
-	default:
-		obs_scale_type = VIDEO_SCALE_BICUBIC;
-		break;
-	}
-
-	blog(LOG_DEBUG, "[ndi-converter] Creating video_scaler...");
-	int result = video_scaler_create(&converter->scaler, &dst_info, &src_info, obs_scale_type);
-	if (result != VIDEO_SCALER_SUCCESS) {
-		blog(LOG_ERROR, "[ndi-converter] Failed to create video scaler: %d", result);
-		converter->scaler = nullptr;
-		return false;
-	}
-	blog(LOG_INFO, "[ndi-converter] Scaler created successfully");
-
-	// Update source dimensions
-	converter->source_width = source_width;
-	converter->source_height = source_height;
-	converter->source_format = source_format;
-
-	// Allocate scaled buffer
-	size_t required_size = converter->target_width * converter->target_height * 4; // BGRA = 4 bytes per pixel
-	if (converter->scaled_buffer_size < required_size) {
-		blog(LOG_DEBUG, "[ndi-converter] Allocating scaled buffer: %zu bytes", required_size);
-		if (converter->scaled_buffer) {
-			bfree(converter->scaled_buffer);
-		}
-		converter->scaled_buffer = (uint8_t *)bmalloc(required_size);
-		converter->scaled_buffer_size = required_size;
-	}
-
-	blog(LOG_INFO, "[ndi-converter] Scaler setup complete");
-	return true;
-}
-
-bool ndi_converter_scale_video(ndi_video_converter_t *converter, uint8_t *frame_in[], uint32_t linesize_in[],
-			       uint32_t source_width, uint32_t source_height, enum video_format source_format,
-			       uint8_t **frame_out, uint32_t *linesize_out)
-{
-	blog(LOG_DEBUG, "[ndi-converter] scale_video called: %dx%d", source_width, source_height);
-
-	if (!ndi_converter_update_scaler(converter, source_width, source_height, source_format)) {
-		blog(LOG_DEBUG, "[ndi-converter] update_scaler returned false");
-		return false;
-	}
-
-	if (!converter->scaler || !converter->scaled_buffer) {
-		blog(LOG_ERROR, "[ndi-converter] No scaler or buffer after update!");
-		return false;
-	}
-
-	// Prepare output arrays for scaler
-	uint8_t *output_planes[1] = {converter->scaled_buffer};
-	uint32_t output_linesize[1] = {converter->target_width * 4}; // BGRA = 4 bytes per pixel
-
-	blog(LOG_DEBUG, "[ndi-converter] Calling video_scaler_scale...");
-	// Scale the video
-	bool success = video_scaler_scale(converter->scaler, output_planes, output_linesize,
-					  (const uint8_t *const *)frame_in, linesize_in);
-
-	blog(LOG_DEBUG, "[ndi-converter] video_scaler_scale returned: %d", success);
-
-	if (success) {
-		*frame_out = converter->scaled_buffer;
-		*linesize_out = converter->target_width * 4; // BGRA linesize
-		blog(LOG_DEBUG, "[ndi-converter] Scaling successful");
-		return true;
-	}
-
-	blog(LOG_WARNING, "[ndi-converter] Scaling failed");
-	return false;
+	// Test accumulator without mutating state
+	int64_t test_accumulator = converter->accumulator_ns + delta_ns;
+	return test_accumulator >= converter->target_frame_interval_ns;
 }
 
 bool ndi_converter_should_send_frame(ndi_video_converter_t *converter, uint64_t frame_timestamp, int *frames_to_send)
@@ -505,16 +397,5 @@ bool ndi_converter_should_send_frame(ndi_video_converter_t *converter, uint64_t 
 
 void ndi_converter_destroy(ndi_video_converter_t *converter)
 {
-	if (converter->scaler) {
-		video_scaler_destroy(converter->scaler);
-		converter->scaler = nullptr;
-	}
-
-	if (converter->scaled_buffer) {
-		bfree(converter->scaled_buffer);
-		converter->scaled_buffer = nullptr;
-		converter->scaled_buffer_size = 0;
-	}
-
 	memset(converter, 0, sizeof(ndi_video_converter_t));
 }
