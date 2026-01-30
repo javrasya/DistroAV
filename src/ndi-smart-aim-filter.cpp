@@ -143,8 +143,10 @@ static void smart_aim_output_raw_video(void *data, video_data *frame)
 	}
 
 	pthread_mutex_lock(&out->sender_mutex);
-	// Use async send to prevent blocking on network backpressure
-	ndiLib->send_send_video_async_v2(out->ndi_sender, &video_frame);
+	// Double-check after acquiring lock (sender could have been destroyed)
+	if (out->ndi_sender) {
+		ndiLib->send_send_video_async_v2(out->ndi_sender, &video_frame);
+	}
 	pthread_mutex_unlock(&out->sender_mutex);
 }
 
@@ -319,8 +321,13 @@ static void ndi_smart_aim_filter_render_video(void *data, gs_effect_t *)
 		if (!is_output_valid(f, out))
 			continue;
 
-		// Skip if no receivers
-		if (ndiLib->send_get_no_connections(out->ndi_sender, 0) == 0)
+		// Check for receivers under lock to avoid race with update thread
+		pthread_mutex_lock(&out->sender_mutex);
+		bool has_connections = out->ndi_sender &&
+				       ndiLib->send_get_no_connections(out->ndi_sender, 0) > 0;
+		pthread_mutex_unlock(&out->sender_mutex);
+
+		if (!has_connections)
 			continue;
 
 		// FPS gating - skip GPU work for frames that will be dropped
@@ -335,13 +342,19 @@ static void ndi_smart_aim_filter_render_video(void *data, gs_effect_t *)
 
 static void output_destroy_sender(smart_aim_output_t *out)
 {
-	// Clean up video_output when sender is destroyed
+	// FIRST: Stop video_output to ensure callback is not running
+	// This MUST happen before touching the sender to avoid race condition
 	if (out->video_output) {
 		video_output_stop(out->video_output);
 		video_output_close(out->video_output);
 		out->video_output = nullptr;
 	}
 
+	// Reset dimensions to force video_output recreation if re-enabled
+	out->known_width = 0;
+	out->known_height = 0;
+
+	// NOW safe to destroy sender - callback is guaranteed stopped
 	if (!out->ndi_sender)
 		return;
 	pthread_mutex_lock(&out->sender_mutex);
@@ -438,6 +451,10 @@ static void add_output_properties(obs_properties_t *props, int index)
 	obs_property_list_add_int(fps_mode, "15", NDI_FRAMERATE_15);
 	obs_property_list_add_int(fps_mode, "30", NDI_FRAMERATE_30);
 	obs_property_list_add_int(fps_mode, "60", NDI_FRAMERATE_60);
+	obs_property_list_add_int(fps_mode, "Custom", NDI_FRAMERATE_CUSTOM);
+
+	build_prop_name(prop_name, sizeof(prop_name), index, "custom_fps");
+	obs_properties_add_int(group_fps, prop_name, "Custom FPS", 1, 240, 1);
 
 	snprintf(grp, sizeof(grp), "output_%d_fps", index + 1);
 	obs_properties_add_group(group, grp, "Frame Rate", OBS_GROUP_NORMAL, group_fps);
@@ -489,6 +506,9 @@ static void set_output_defaults(obs_data_t *d, int i)
 
 	build_prop_name(p, sizeof(p), i, "framerate_mode");
 	obs_data_set_default_int(d, p, NDI_FRAMERATE_30);
+
+	build_prop_name(p, sizeof(p), i, "custom_fps");
+	obs_data_set_default_int(d, p, 30);
 }
 
 static void ndi_smart_aim_filter_getdefaults(obs_data_t *d)
@@ -502,6 +522,19 @@ static void update_output(smart_aim_output_t *out, obs_data_t *s, int i)
 {
 	char p[128];
 
+	// FIRST: Stop video_output to ensure callback is not running
+	// This MUST happen before modifying any state the callback uses
+	if (out->video_output) {
+		video_output_stop(out->video_output);
+		video_output_close(out->video_output);
+		out->video_output = nullptr;
+	}
+
+	// Reset dimensions to force video_output recreation
+	out->known_width = 0;
+	out->known_height = 0;
+
+	// NOW safe to update settings - callback is guaranteed stopped
 	build_prop_name(p, sizeof(p), i, "enabled");
 	out->enabled = obs_data_get_bool(s, p);
 
@@ -538,6 +571,9 @@ static void update_output(smart_aim_output_t *out, obs_data_t *s, int i)
 	obs_data_set_bool(cs, "enable_custom_framerate", obs_data_get_bool(s, p));
 	build_prop_name(p, sizeof(p), i, "framerate_mode");
 	obs_data_set_int(cs, "framerate_mode", obs_data_get_int(s, p));
+	build_prop_name(p, sizeof(p), i, "custom_fps");
+	obs_data_set_int(cs, "custom_fps_num", obs_data_get_int(s, p));
+	obs_data_set_int(cs, "custom_fps_den", 1);
 
 	ndi_converter_update(&out->converter, cs);
 	obs_data_release(cs);
@@ -585,14 +621,9 @@ static void ndi_smart_aim_filter_destroy(void *data)
 	for (int i = 0; i < MAX_SMART_AIM_OUTPUTS; i++) {
 		smart_aim_output_t *out = &f->outputs[i];
 
-		// Clean up video_output first (stops callback)
-		if (out->video_output) {
-			video_output_stop(out->video_output);
-			video_output_close(out->video_output);
-			out->video_output = nullptr;
-		}
-
+		// output_destroy_sender handles video_output cleanup safely
 		output_destroy_sender(out);
+
 		gs_stagesurface_unmap(out->stagesurface);
 		gs_stagesurface_destroy(out->stagesurface);
 		gs_texrender_destroy(out->texrender);
