@@ -56,6 +56,7 @@ target_sources(
     src/ndi-filter.cpp
     src/ndi-finder.h
     src/ndi-finder.cpp
+    src/ndi-smart-aim-filter.cpp
     src/ndi-output.cpp
     src/ndi-source.cpp
     src/ndi-video-converter.cpp

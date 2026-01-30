@@ -27,11 +27,16 @@ cmake --install build_x86_64 --prefix release/RelWithDebInfo --config RelWithDeb
 
 ## Install to OBS
 
-After building, copy the plugin to OBS plugins folder:
+After building and installing to the release folder, copy the plugin to OBS plugins folder.
 
-**Windows (PowerShell):**
+**Windows (PowerShell - run from project root):**
 ```powershell
-Copy-Item "release/RelWithDebInfo/distroav" "C:\ProgramData\obs-studio\plugins\" -Recurse -Force
+Copy-Item -Path "release\RelWithDebInfo\distroav" -Destination "C:\ProgramData\obs-studio\plugins\" -Recurse -Force
+```
+
+**Windows (Bash/Git Bash - run from project root):**
+```bash
+powershell -Command "Copy-Item -Path 'release\RelWithDebInfo\distroav' -Destination 'C:\ProgramData\obs-studio\plugins\' -Recurse -Force"
 ```
 
 **macOS:**
