@@ -1,0 +1,12 @@
+[project]
+name = "gaze-receiver"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "av>=16.1.0",
+    "numpy>=2.4.2",
+    "opencv-python>=4.13.0.90",
+    "zeroconf>=0.148.0",
+]

@@ -19,6 +19,39 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 find_package(CURL REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE CURL::libcurl)
 
+# FFmpeg for Gaze Stream hardware encoding (from OBS deps)
+if(OS_WINDOWS)
+  # Find the OBS deps directory containing FFmpeg
+  set(_obs_deps_dir "${CMAKE_SOURCE_DIR}/.deps/obs-deps-2024-09-12-x64")
+  if(EXISTS "${_obs_deps_dir}/include/libavcodec")
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${_obs_deps_dir}/include")
+    target_link_libraries(
+      ${CMAKE_PROJECT_NAME}
+      PRIVATE "${_obs_deps_dir}/lib/avcodec.lib" "${_obs_deps_dir}/lib/avutil.lib"
+              "${_obs_deps_dir}/lib/swscale.lib"
+    )
+  else()
+    message(WARNING "FFmpeg not found in OBS deps - Gaze Stream filter may not build correctly")
+  endif()
+elseif(OS_MACOS)
+  find_library(AVCODEC_LIBRARY avcodec)
+  find_library(AVUTIL_LIBRARY avutil)
+  find_library(SWSCALE_LIBRARY swscale)
+  if(AVCODEC_LIBRARY AND AVUTIL_LIBRARY AND SWSCALE_LIBRARY)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${AVCODEC_LIBRARY} ${AVUTIL_LIBRARY} ${SWSCALE_LIBRARY})
+  endif()
+elseif(OS_LINUX)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FFMPEG REQUIRED libavcodec libavutil libswscale)
+  target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_LIBRARIES})
+endif()
+
+# Platform-specific networking for Gaze Stream
+if(WIN32)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32)
+endif()
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
@@ -66,6 +99,20 @@ target_sources(
     src/premultiplied-alpha-filter.cpp
     src/preview-output.cpp
     src/preview-output.h
+    # Gaze Stream filter
+    src/gaze-filter.cpp
+    src/gaze-filter.h
+    src/gaze/gaze-protocol.h
+    src/gaze/gaze-encoder.cpp
+    src/gaze/gaze-encoder.h
+    src/gaze/gaze-fec.cpp
+    src/gaze/gaze-fec.h
+    src/gaze/gaze-packetizer.cpp
+    src/gaze/gaze-packetizer.h
+    src/gaze/gaze-sender.cpp
+    src/gaze/gaze-sender.h
+    src/gaze/gaze-discovery.cpp
+    src/gaze/gaze-discovery.h
 )
 
 set(valid_uuid FALSE)

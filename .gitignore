@@ -43,3 +43,6 @@ scratch/
 !/CI
 !/lib
 !/tools
+
+.venv
+*.pyc

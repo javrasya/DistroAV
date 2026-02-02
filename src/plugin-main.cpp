@@ -64,6 +64,9 @@ struct obs_source_info ndi_audiofilter_info;
 extern struct obs_source_info create_ndi_smart_aim_filter_info();
 struct obs_source_info ndi_smart_aim_filter_info;
 
+extern struct obs_source_info create_gaze_filter_info();
+struct obs_source_info gaze_filter_info;
+
 extern struct obs_source_info create_alpha_filter_info();
 struct obs_source_info alpha_filter_info;
 
@@ -346,6 +349,9 @@ bool obs_module_load(void)
 
 	ndi_smart_aim_filter_info = create_ndi_smart_aim_filter_info();
 	obs_register_source(&ndi_smart_aim_filter_info);
+
+	gaze_filter_info = create_gaze_filter_info();
+	obs_register_source(&gaze_filter_info);
 
 	alpha_filter_info = create_alpha_filter_info();
 	obs_register_source(&alpha_filter_info);
