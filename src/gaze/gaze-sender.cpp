@@ -26,9 +26,6 @@
 static bool winsock_initialized = false;
 #endif
 
-// Default multicast group
-#define GAZE_MULTICAST_GROUP "239.255.42.99"
-
 // Close socket helper
 static void close_socket(gaze_socket_t sock)
 {
@@ -84,13 +81,137 @@ void gaze_sender_cleanup_platform(void)
 #endif
 }
 
-// RTCP listener thread
-static void *rtcp_thread_func(void *arg)
+// Compare sockaddr_in addresses
+static bool addr_equals(const struct sockaddr_in *a, const struct sockaddr_in *b)
+{
+	return a->sin_addr.s_addr == b->sin_addr.s_addr &&
+	       a->sin_port == b->sin_port;
+}
+
+// Add or update a receiver in the list
+static void add_or_update_receiver(gaze_sender_t *sender,
+				   const struct sockaddr_in *from_addr)
+{
+	uint64_t now = os_gettime_ns();
+
+	// Check if receiver already exists
+	for (int i = 0; i < GAZE_MAX_RECEIVERS; i++) {
+		if (sender->receivers[i].active &&
+		    addr_equals(&sender->receivers[i].addr, from_addr)) {
+			// Update last seen time
+			sender->receivers[i].last_seen_ns = now;
+			return;
+		}
+	}
+
+	// Find empty slot
+	for (int i = 0; i < GAZE_MAX_RECEIVERS; i++) {
+		if (!sender->receivers[i].active) {
+			sender->receivers[i].addr = *from_addr;
+			sender->receivers[i].last_seen_ns = now;
+			sender->receivers[i].active = true;
+			sender->receiver_count++;
+
+			char ip_str[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &from_addr->sin_addr, ip_str,
+				  sizeof(ip_str));
+			obs_log(LOG_INFO,
+				"[gaze-sender] Receiver subscribed: %s:%d (total: %d)",
+				ip_str, ntohs(from_addr->sin_port),
+				sender->receiver_count);
+			return;
+		}
+	}
+
+	// No slots available
+	obs_log(LOG_WARNING,
+		"[gaze-sender] Max receivers reached (%d), ignoring new subscription",
+		GAZE_MAX_RECEIVERS);
+}
+
+// Remove a receiver from the list
+static void remove_receiver(gaze_sender_t *sender,
+			    const struct sockaddr_in *from_addr)
+{
+	for (int i = 0; i < GAZE_MAX_RECEIVERS; i++) {
+		if (sender->receivers[i].active &&
+		    addr_equals(&sender->receivers[i].addr, from_addr)) {
+			char ip_str[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &from_addr->sin_addr, ip_str,
+				  sizeof(ip_str));
+			obs_log(LOG_INFO,
+				"[gaze-sender] Receiver unsubscribed: %s:%d",
+				ip_str, ntohs(from_addr->sin_port));
+
+			sender->receivers[i].active = false;
+			sender->receiver_count--;
+			return;
+		}
+	}
+}
+
+// Prune receivers that haven't sent heartbeats within timeout
+static void prune_inactive_receivers(gaze_sender_t *sender)
+{
+	uint64_t now = os_gettime_ns();
+
+	for (int i = 0; i < GAZE_MAX_RECEIVERS; i++) {
+		if (sender->receivers[i].active &&
+		    (now - sender->receivers[i].last_seen_ns) > GAZE_RECEIVER_TIMEOUT_NS) {
+			char ip_str[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &sender->receivers[i].addr.sin_addr,
+				  ip_str, sizeof(ip_str));
+			obs_log(LOG_INFO,
+				"[gaze-sender] Receiver timed out: %s:%d",
+				ip_str, ntohs(sender->receivers[i].addr.sin_port));
+
+			sender->receivers[i].active = false;
+			sender->receiver_count--;
+		}
+	}
+}
+
+// Handle incoming control message
+static void handle_control_message(gaze_sender_t *sender,
+				   const uint8_t *data, int len,
+				   struct sockaddr_in *from_addr)
+{
+	if (len < 4)
+		return;
+
+	// Check magic bytes
+	if (data[0] != GAZE_CTRL_MAGIC_0 || data[1] != GAZE_CTRL_MAGIC_1)
+		return;
+
+	uint8_t msg_type = data[2];
+
+	pthread_mutex_lock(&sender->receiver_mutex);
+
+	switch (msg_type) {
+	case GAZE_CTRL_SUBSCRIBE:
+	case GAZE_CTRL_HEARTBEAT:
+		add_or_update_receiver(sender, from_addr);
+		sender->stats.control_received++;
+		break;
+	case GAZE_CTRL_UNSUBSCRIBE:
+		remove_receiver(sender, from_addr);
+		sender->stats.control_received++;
+		break;
+	default:
+		// Unknown message type, ignore
+		break;
+	}
+
+	pthread_mutex_unlock(&sender->receiver_mutex);
+}
+
+// Control message listener thread
+static void *control_thread_func(void *arg)
 {
 	gaze_sender_t *sender = (gaze_sender_t *)arg;
-	char buffer[1500];
+	uint8_t buffer[64];
 
-	while (sender->rtcp_running) {
+	while (sender->control_running) {
 		fd_set read_fds;
 		FD_ZERO(&read_fds);
 		FD_SET(sender->rtcp_socket, &read_fds);
@@ -106,28 +227,15 @@ static void *rtcp_thread_func(void *arg)
 			struct sockaddr_in from_addr;
 			socklen_t from_len = sizeof(from_addr);
 
-			int received = recvfrom(sender->rtcp_socket, buffer,
-						sizeof(buffer), 0,
+			int received = recvfrom(sender->rtcp_socket,
+						(char *)buffer, sizeof(buffer),
+						0,
 						(struct sockaddr *)&from_addr,
 						&from_len);
 
-			if (received >= (int)sizeof(gaze_rtcp_header_t)) {
-				gaze_rtcp_header_t *rtcp =
-					(gaze_rtcp_header_t *)buffer;
-
-				// Check for valid RTCP packet
-				uint8_t version =
-					GAZE_RTCP_GET_VERSION(rtcp->flags);
-				if (version == 2 &&
-				    (rtcp->packet_type == GAZE_RTCP_RR ||
-				     rtcp->packet_type == GAZE_RTCP_SR)) {
-					pthread_mutex_lock(&sender->rtcp_mutex);
-					sender->last_rtcp_received_ns =
-						os_gettime_ns();
-					sender->stats.rtcp_received++;
-					pthread_mutex_unlock(
-						&sender->rtcp_mutex);
-				}
+			if (received > 0) {
+				handle_control_message(sender, buffer, received,
+						       &from_addr);
 			}
 		}
 	}
@@ -135,8 +243,8 @@ static void *rtcp_thread_func(void *arg)
 	return nullptr;
 }
 
-bool gaze_sender_init(gaze_sender_t *sender, const char *target_host,
-		      uint16_t rtp_port, bool multicast)
+bool gaze_sender_init(gaze_sender_t *sender, uint16_t rtp_port,
+		      uint32_t bind_addr)
 {
 	if (!sender)
 		return false;
@@ -151,7 +259,7 @@ bool gaze_sender_init(gaze_sender_t *sender, const char *target_host,
 	}
 
 	sender->rtp_port = rtp_port;
-	sender->multicast = multicast;
+	sender->bind_addr = bind_addr;
 
 	// Create RTP socket
 	sender->rtp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -160,11 +268,11 @@ bool gaze_sender_init(gaze_sender_t *sender, const char *target_host,
 		return false;
 	}
 
-	// Create RTCP socket
+	// Create control/RTCP socket
 	sender->rtcp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (sender->rtcp_socket == GAZE_INVALID_SOCKET) {
 		obs_log(LOG_ERROR,
-			"[gaze-sender] Failed to create RTCP socket");
+			"[gaze-sender] Failed to create control socket");
 		close_socket(sender->rtp_socket);
 		sender->rtp_socket = GAZE_INVALID_SOCKET;
 		return false;
@@ -175,93 +283,55 @@ bool gaze_sender_init(gaze_sender_t *sender, const char *target_host,
 	setsockopt(sender->rtp_socket, SOL_SOCKET, SO_SNDBUF,
 		   (const char *)&send_buf, sizeof(send_buf));
 
-	// Set socket options for multicast
-	if (multicast) {
-		// Set TTL for multicast
-		int ttl = 1;
-		setsockopt(sender->rtp_socket, IPPROTO_IP, IP_MULTICAST_TTL,
-			   (const char *)&ttl, sizeof(ttl));
-
-		// Set loopback off
-		int loopback = 0;
-		setsockopt(sender->rtp_socket, IPPROTO_IP, IP_MULTICAST_LOOP,
-			   (const char *)&loopback, sizeof(loopback));
-
-		// Use default multicast group
-		memset(&sender->target_addr, 0, sizeof(sender->target_addr));
-		sender->target_addr.sin_family = AF_INET;
-		sender->target_addr.sin_port = htons(rtp_port);
-		inet_pton(AF_INET, GAZE_MULTICAST_GROUP,
-			  &sender->target_addr.sin_addr);
-	} else {
-		// Unicast - set target address
-		if (!target_host || target_host[0] == '\0') {
-			obs_log(LOG_ERROR,
-				"[gaze-sender] No target host for unicast");
-			close_socket(sender->rtp_socket);
-			close_socket(sender->rtcp_socket);
-			sender->rtp_socket = GAZE_INVALID_SOCKET;
-			sender->rtcp_socket = GAZE_INVALID_SOCKET;
-			return false;
-		}
-
-		memset(&sender->target_addr, 0, sizeof(sender->target_addr));
-		sender->target_addr.sin_family = AF_INET;
-		sender->target_addr.sin_port = htons(rtp_port);
-
-		if (inet_pton(AF_INET, target_host,
-			      &sender->target_addr.sin_addr) != 1) {
-			obs_log(LOG_ERROR,
-				"[gaze-sender] Invalid target host: %s",
-				target_host);
-			close_socket(sender->rtp_socket);
-			close_socket(sender->rtcp_socket);
-			sender->rtp_socket = GAZE_INVALID_SOCKET;
-			sender->rtcp_socket = GAZE_INVALID_SOCKET;
-			return false;
-		}
-	}
-
-	// Bind RTCP socket to receive responses
-	struct sockaddr_in rtcp_addr;
-	memset(&rtcp_addr, 0, sizeof(rtcp_addr));
-	rtcp_addr.sin_family = AF_INET;
-	rtcp_addr.sin_addr.s_addr = INADDR_ANY;
-	rtcp_addr.sin_port = htons(rtp_port + 1);
+	// Bind control socket to receive subscriptions
+	struct sockaddr_in ctrl_addr;
+	memset(&ctrl_addr, 0, sizeof(ctrl_addr));
+	ctrl_addr.sin_family = AF_INET;
+	ctrl_addr.sin_addr.s_addr = bind_addr;  // 0 = INADDR_ANY
+	ctrl_addr.sin_port = htons(rtp_port + 1);
 
 	// Allow address reuse
 	int reuse = 1;
 	setsockopt(sender->rtcp_socket, SOL_SOCKET, SO_REUSEADDR,
 		   (const char *)&reuse, sizeof(reuse));
 
-	if (bind(sender->rtcp_socket, (struct sockaddr *)&rtcp_addr,
-		 sizeof(rtcp_addr)) != 0) {
-		obs_log(LOG_WARNING,
-			"[gaze-sender] Failed to bind RTCP socket to port %d",
+	if (bind(sender->rtcp_socket, (struct sockaddr *)&ctrl_addr,
+		 sizeof(ctrl_addr)) != 0) {
+		obs_log(LOG_ERROR,
+			"[gaze-sender] Failed to bind control socket to port %d",
 			rtp_port + 1);
-		// Continue anyway - RTCP is optional
+		close_socket(sender->rtp_socket);
+		close_socket(sender->rtcp_socket);
+		sender->rtp_socket = GAZE_INVALID_SOCKET;
+		sender->rtcp_socket = GAZE_INVALID_SOCKET;
+		return false;
 	}
 
-	// Set RTCP socket non-blocking
+	// Set control socket non-blocking
 	set_nonblocking(sender->rtcp_socket);
 
-	// Initialize RTCP mutex
-	pthread_mutex_init(&sender->rtcp_mutex, nullptr);
+	// Initialize receiver mutex
+	pthread_mutex_init(&sender->receiver_mutex, nullptr);
 
-	// Start RTCP listener thread
-	sender->rtcp_running = true;
-	if (pthread_create(&sender->rtcp_thread, nullptr, rtcp_thread_func,
+	// Start control message listener thread
+	sender->control_running = true;
+	if (pthread_create(&sender->control_thread, nullptr, control_thread_func,
 			   sender) != 0) {
-		obs_log(LOG_WARNING,
-			"[gaze-sender] Failed to create RTCP thread");
-		sender->rtcp_running = false;
+		obs_log(LOG_ERROR,
+			"[gaze-sender] Failed to create control thread");
+		pthread_mutex_destroy(&sender->receiver_mutex);
+		close_socket(sender->rtp_socket);
+		close_socket(sender->rtcp_socket);
+		sender->rtp_socket = GAZE_INVALID_SOCKET;
+		sender->rtcp_socket = GAZE_INVALID_SOCKET;
+		return false;
 	}
 
 	sender->initialized = true;
 
-	obs_log(LOG_INFO, "[gaze-sender] Initialized: %s:%d (%s)",
-		multicast ? GAZE_MULTICAST_GROUP : target_host, rtp_port,
-		multicast ? "multicast" : "unicast");
+	obs_log(LOG_INFO,
+		"[gaze-sender] Initialized on port %d (control: %d), waiting for receivers",
+		rtp_port, rtp_port + 1);
 
 	return true;
 }
@@ -272,22 +342,35 @@ bool gaze_sender_send_packets(gaze_sender_t *sender, gaze_packet_t *packets,
 	if (!sender || !sender->initialized || !packets || packet_count == 0)
 		return false;
 
-	// Send packets in batches
-	for (size_t i = 0; i < packet_count; i++) {
-		gaze_packet_t *pkt = &packets[i];
+	pthread_mutex_lock(&sender->receiver_mutex);
 
-		int sent = sendto(sender->rtp_socket, (const char *)pkt->data,
-				  (int)pkt->size, 0,
-				  (struct sockaddr *)&sender->target_addr,
-				  sizeof(sender->target_addr));
+	// Prune timed-out receivers
+	prune_inactive_receivers(sender);
 
-		if (sent > 0) {
-			sender->stats.packets_sent++;
-			sender->stats.bytes_sent += sent;
-		} else {
-			sender->stats.send_errors++;
+	// Send to each active receiver
+	for (int r = 0; r < GAZE_MAX_RECEIVERS; r++) {
+		if (!sender->receivers[r].active)
+			continue;
+
+		for (size_t i = 0; i < packet_count; i++) {
+			gaze_packet_t *pkt = &packets[i];
+
+			int sent = sendto(sender->rtp_socket,
+					  (const char *)pkt->data,
+					  (int)pkt->size, 0,
+					  (struct sockaddr *)&sender->receivers[r].addr,
+					  sizeof(sender->receivers[r].addr));
+
+			if (sent > 0) {
+				sender->stats.packets_sent++;
+				sender->stats.bytes_sent += sent;
+			} else {
+				sender->stats.send_errors++;
+			}
 		}
 	}
+
+	pthread_mutex_unlock(&sender->receiver_mutex);
 
 	return true;
 }
@@ -297,35 +380,25 @@ bool gaze_sender_has_receivers(gaze_sender_t *sender)
 	if (!sender || !sender->initialized)
 		return false;
 
-	// For unicast, always assume receiver is present
-	// (we're sending to a specific host, no need for RTCP detection)
-	if (!sender->multicast)
-		return true;
+	pthread_mutex_lock(&sender->receiver_mutex);
+	prune_inactive_receivers(sender);
+	bool has = (sender->receiver_count > 0);
+	pthread_mutex_unlock(&sender->receiver_mutex);
 
-	// For multicast, use RTCP detection
-	if (!sender->rtcp_running)
-		return true;
-
-	pthread_mutex_lock(&sender->rtcp_mutex);
-	uint64_t last_rtcp = sender->last_rtcp_received_ns;
-	pthread_mutex_unlock(&sender->rtcp_mutex);
-
-	if (last_rtcp == 0)
-		return false;
-
-	// Check if within timeout
-	uint64_t now = os_gettime_ns();
-	return (now - last_rtcp) < GAZE_RTCP_TIMEOUT_NS;
+	return has;
 }
 
-void gaze_sender_assume_receiver(gaze_sender_t *sender)
+int gaze_sender_get_receiver_count(gaze_sender_t *sender)
 {
-	if (!sender)
-		return;
+	if (!sender || !sender->initialized)
+		return 0;
 
-	pthread_mutex_lock(&sender->rtcp_mutex);
-	sender->last_rtcp_received_ns = os_gettime_ns();
-	pthread_mutex_unlock(&sender->rtcp_mutex);
+	pthread_mutex_lock(&sender->receiver_mutex);
+	prune_inactive_receivers(sender);
+	int count = sender->receiver_count;
+	pthread_mutex_unlock(&sender->receiver_mutex);
+
+	return count;
 }
 
 void gaze_sender_get_stats(gaze_sender_t *sender, gaze_sender_stats_t *stats)
@@ -344,39 +417,18 @@ void gaze_sender_reset_stats(gaze_sender_t *sender)
 	memset(&sender->stats, 0, sizeof(sender->stats));
 }
 
-bool gaze_sender_set_target(gaze_sender_t *sender, const char *target_host)
-{
-	if (!sender || !sender->initialized || sender->multicast)
-		return false;
-
-	if (!target_host || target_host[0] == '\0')
-		return false;
-
-	struct sockaddr_in new_addr;
-	memset(&new_addr, 0, sizeof(new_addr));
-	new_addr.sin_family = AF_INET;
-	new_addr.sin_port = htons(sender->rtp_port);
-
-	if (inet_pton(AF_INET, target_host, &new_addr.sin_addr) != 1) {
-		return false;
-	}
-
-	sender->target_addr = new_addr;
-	return true;
-}
-
 void gaze_sender_destroy(gaze_sender_t *sender)
 {
 	if (!sender || !sender->initialized)
 		return;
 
-	// Stop RTCP thread
-	if (sender->rtcp_running) {
-		sender->rtcp_running = false;
-		pthread_join(sender->rtcp_thread, nullptr);
+	// Stop control thread
+	if (sender->control_running) {
+		sender->control_running = false;
+		pthread_join(sender->control_thread, nullptr);
 	}
 
-	pthread_mutex_destroy(&sender->rtcp_mutex);
+	pthread_mutex_destroy(&sender->receiver_mutex);
 
 	// Close sockets
 	close_socket(sender->rtcp_socket);

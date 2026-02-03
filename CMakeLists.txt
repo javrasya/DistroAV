@@ -113,6 +113,8 @@ target_sources(
     src/gaze/gaze-sender.h
     src/gaze/gaze-discovery.cpp
     src/gaze/gaze-discovery.h
+    src/gaze/gaze-network.cpp
+    src/gaze/gaze-network.h
 )
 
 set(valid_uuid FALSE)

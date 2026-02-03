@@ -22,6 +22,7 @@
 #include "gaze/gaze-packetizer.h"
 #include "gaze/gaze-sender.h"
 #include "gaze/gaze-discovery.h"
+#include "gaze/gaze-network.h"
 #include "ndi-video-converter.h"
 
 #include <obs-module.h>
@@ -30,18 +31,53 @@
 #define MAX_GAZE_OUTPUTS 4
 
 /**
+ * Crop type for Gaze filter.
+ */
+enum gaze_crop_type {
+	GAZE_CROP_TYPE_PIXEL = 0,         // Absolute pixel coordinates
+	GAZE_CROP_TYPE_PERCENTAGE         // Percentage-based (0-100)
+};
+
+/**
+ * Reference point for crop positioning.
+ * Defines the anchor point for Reference X/Y coordinates.
+ */
+enum gaze_crop_reference {
+	GAZE_CROP_REF_TOP_LEFT = 0,       // Default (current behavior)
+	GAZE_CROP_REF_TOP_CENTER,
+	GAZE_CROP_REF_TOP_RIGHT,
+	GAZE_CROP_REF_CENTER_LEFT,
+	GAZE_CROP_REF_CENTER,
+	GAZE_CROP_REF_CENTER_RIGHT,
+	GAZE_CROP_REF_BOTTOM_LEFT,
+	GAZE_CROP_REF_BOTTOM_CENTER,
+	GAZE_CROP_REF_BOTTOM_RIGHT
+};
+
+/**
  * Per-output state for Gaze Stream filter
  */
 typedef struct gaze_output {
 	// Configuration
 	bool enabled;
 	char stream_name[256];
-	char target_host[256];
-	uint16_t base_port;
-	bool multicast;
+	uint16_t rtp_port;  // Fixed: GAZE_BASE_PORT + (output_index * 2)
 
 	// Video converter (resolution/crop/fps)
 	ndi_video_converter_t converter;
+
+	// Gaze-specific crop settings (with reference point support)
+	// These are processed before passing to converter
+	enum gaze_crop_type crop_type;          // Pixel or Percentage
+	enum gaze_crop_reference crop_reference; // Anchor point
+	int32_t crop_ref_x;                     // Reference X (pixel)
+	int32_t crop_ref_y;                     // Reference Y (pixel)
+	double crop_ref_x_pct;                  // Reference X (percentage)
+	double crop_ref_y_pct;                  // Reference Y (percentage)
+	uint32_t crop_w;                        // Width (pixel)
+	uint32_t crop_h;                        // Height (pixel)
+	double crop_w_pct;                      // Width (percentage)
+	double crop_h_pct;                      // Height (percentage)
 
 	// GPU resources
 	gs_texrender_t *texrender;
@@ -85,11 +121,20 @@ typedef struct gaze_filter {
 	uint8_t fec_percent;
 	bool stop_when_inactive;
 
+	// Network interface selection
+	char network_interface_ip[GAZE_INTERFACE_IP_LEN];  // Selected IP or empty for auto
+	uint32_t network_bind_addr;    // IPv4 address in network byte order (0 = any)
+	uint32_t network_if_index;     // Interface index for mDNS (0 = all)
+
 	// Per-output state
 	gaze_output_t outputs[MAX_GAZE_OUTPUTS];
 
 	// OBS video info
 	obs_video_info ovi;
+
+	// Timestamp offset: wall_clock_ms - obs_time_ms at startup
+	// Used to convert OBS frame timestamps to wall clock for latency measurement
+	int64_t timestamp_offset_ms;
 } gaze_filter_t;
 
 /**

@@ -24,7 +24,7 @@ from src.discovery import discover_streams, manual_stream, GazeStreamService
 from src.receiver import GazeReceiver, ReceivedFrame
 from src.decoder import GazeDecoder
 from src.display import GazeDisplay
-from src.protocol import GAZE_DEFAULT_RTP_PORT
+from src.protocol import GAZE_BASE_PORT
 
 
 def select_stream() -> Optional[GazeStreamService]:
@@ -55,8 +55,8 @@ def select_stream() -> Optional[GazeStreamService]:
 
         if choice == '0':
             host = input("Enter IP address: ").strip()
-            port_str = input(f"Enter port [{GAZE_DEFAULT_RTP_PORT}]: ").strip()
-            port = int(port_str) if port_str else GAZE_DEFAULT_RTP_PORT
+            port_str = input(f"Enter port [{GAZE_BASE_PORT}]: ").strip()
+            port = int(port_str) if port_str else GAZE_BASE_PORT
             return manual_stream(host, port)
 
         try:
@@ -167,8 +167,8 @@ Examples:
     parser.add_argument(
         "--port", "-p",
         type=int,
-        default=GAZE_DEFAULT_RTP_PORT,
-        help=f"RTP port (default: {GAZE_DEFAULT_RTP_PORT})",
+        default=GAZE_BASE_PORT,
+        help=f"RTP port (default: {GAZE_BASE_PORT})",
     )
     parser.add_argument(
         "--discover", "-d",

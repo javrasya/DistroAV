@@ -95,14 +95,19 @@ bool gaze_encoder_is_available(gaze_codec_t codec, gaze_encoder_type_t type)
 
 static bool configure_nvenc(AVCodecContext *ctx, gaze_codec_t codec)
 {
-	(void)codec;
-
 	// Ultra low latency preset
 	av_opt_set(ctx->priv_data, "preset", "p1", 0);
 	av_opt_set(ctx->priv_data, "tune", "ull", 0);
 	av_opt_set(ctx->priv_data, "rc", "cbr", 0);
 	av_opt_set_int(ctx->priv_data, "zerolatency", 1, 0);
 	av_opt_set_int(ctx->priv_data, "delay", 0, 0);
+
+	// HEVC: Force Main profile (8-bit) for Pi 5 hardware decode compatibility
+	// Pi 5's V4L2 stateless decoder does NOT support Main10 (10-bit)
+	if (codec == GAZE_CODEC_HEVC) {
+		av_opt_set(ctx->priv_data, "profile", "main", 0);
+		av_opt_set(ctx->priv_data, "tier", "main", 0);
+	}
 
 	// Disable B-frames for low latency
 	ctx->max_b_frames = 0;
@@ -116,12 +121,16 @@ static bool configure_nvenc(AVCodecContext *ctx, gaze_codec_t codec)
 
 static bool configure_amf(AVCodecContext *ctx, gaze_codec_t codec)
 {
-	(void)codec;
-
 	// Ultra low latency settings
 	av_opt_set(ctx->priv_data, "usage", "ultralowlatency", 0);
 	av_opt_set(ctx->priv_data, "quality", "speed", 0);
 	av_opt_set(ctx->priv_data, "rc", "cbr", 0);
+
+	// HEVC: Force Main profile (8-bit) for Pi 5 hardware decode compatibility
+	if (codec == GAZE_CODEC_HEVC) {
+		av_opt_set(ctx->priv_data, "profile", "main", 0);
+		av_opt_set(ctx->priv_data, "tier", "main", 0);
+	}
 
 	ctx->max_b_frames = 0;
 
@@ -130,12 +139,15 @@ static bool configure_amf(AVCodecContext *ctx, gaze_codec_t codec)
 
 static bool configure_qsv(AVCodecContext *ctx, gaze_codec_t codec)
 {
-	(void)codec;
-
 	// Low latency settings
 	av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
 	av_opt_set_int(ctx->priv_data, "low_delay_brc", 1, 0);
 	av_opt_set_int(ctx->priv_data, "async_depth", 1, 0);
+
+	// HEVC: Force Main profile (8-bit) for Pi 5 hardware decode compatibility
+	if (codec == GAZE_CODEC_HEVC) {
+		av_opt_set(ctx->priv_data, "profile", "main", 0);
+	}
 
 	ctx->max_b_frames = 0;
 
@@ -149,8 +161,11 @@ static bool configure_software(AVCodecContext *ctx, gaze_codec_t codec)
 	av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
 
 	if (codec == GAZE_CODEC_H264) {
-		// x264 specific
+		// x264 specific - baseline for simplest decode
 		av_opt_set(ctx->priv_data, "profile", "baseline", 0);
+	} else if (codec == GAZE_CODEC_HEVC) {
+		// x265 specific - Main profile (8-bit) for Pi 5 hardware decode compatibility
+		av_opt_set(ctx->priv_data, "profile", "main", 0);
 	}
 
 	ctx->max_b_frames = 0;

@@ -17,6 +17,11 @@ from .protocol import (
     GazeCodec,
     GazeFrameType,
     GAZE_MTU,
+    GAZE_CTRL_MAGIC,
+    GAZE_CTRL_SUBSCRIBE,
+    GAZE_CTRL_HEARTBEAT,
+    GAZE_CTRL_UNSUBSCRIBE,
+    GAZE_HEARTBEAT_INTERVAL_S,
 )
 
 
@@ -131,6 +136,8 @@ class GazeReceiver:
     UDP receiver for Gaze Stream.
 
     Receives packets, reassembles frames, and delivers them to a callback.
+    Uses receiver-initiated subscription: sends subscribe/heartbeat messages
+    to the sender's control port.
     """
 
     def __init__(
@@ -142,12 +149,14 @@ class GazeReceiver:
     ):
         self.host = host
         self.port = port
+        self.control_port = port + 1  # Control messages go to RTP port + 1
         self.frame_callback = frame_callback
         self.buffer_size = buffer_size
 
         self._socket: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._heartbeat_thread: Optional[threading.Thread] = None
 
         # Frame assembly state
         self._assemblers: Dict[int, FrameAssembler] = {}
@@ -162,6 +171,26 @@ class GazeReceiver:
         # Frame queue for external consumption
         self.frame_queue: Queue[ReceivedFrame] = Queue(maxsize=10)
 
+    def _build_control_message(self, msg_type: int) -> bytes:
+        """Build a control message (subscribe/heartbeat/unsubscribe)"""
+        return GAZE_CTRL_MAGIC + bytes([msg_type, 0x00])
+
+    def _send_control_message(self, msg_type: int) -> None:
+        """Send a control message to the sender"""
+        if self._socket is None:
+            return
+        try:
+            msg = self._build_control_message(msg_type)
+            self._socket.sendto(msg, (self.host, self.control_port))
+        except Exception:
+            pass  # Silently ignore send errors
+
+    def _heartbeat_loop(self) -> None:
+        """Periodically send heartbeat messages"""
+        while self._running:
+            self._send_control_message(GAZE_CTRL_HEARTBEAT)
+            time.sleep(GAZE_HEARTBEAT_INTERVAL_S)
+
     def start(self) -> None:
         """Start receiving packets"""
         if self._running:
@@ -174,19 +203,39 @@ class GazeReceiver:
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, requested_buffer)
         self._socket.settimeout(1.0)
 
-        # Bind to receive
+        # Bind to receive (use same port for receiving RTP and sending control)
         self._socket.bind(("0.0.0.0", self.port))
 
         self._running = True
+
+        # Send subscribe message to sender
+        self._send_control_message(GAZE_CTRL_SUBSCRIBE)
+
+        # Start receive thread
         self._thread = threading.Thread(target=self._receive_loop, daemon=True)
         self._thread.start()
+
+        # Start heartbeat thread
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
 
     def stop(self) -> None:
         """Stop receiving packets"""
         self._running = False
+
+        # Send unsubscribe message to sender
+        self._send_control_message(GAZE_CTRL_UNSUBSCRIBE)
+
+        # Stop heartbeat thread
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=2.0)
+            self._heartbeat_thread = None
+
+        # Stop receive thread
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
+
         if self._socket:
             self._socket.close()
             self._socket = None

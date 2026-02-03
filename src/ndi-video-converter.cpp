@@ -56,6 +56,22 @@ void ndi_converter_init(ndi_video_converter_t *converter)
 void ndi_converter_get_preset_resolution(enum ndi_resolution_mode mode, uint32_t *width, uint32_t *height)
 {
 	switch (mode) {
+	case NDI_RESOLUTION_240_SQUARE:
+		*width = 240;
+		*height = 240;
+		break;
+	case NDI_RESOLUTION_320_SQUARE:
+		*width = 320;
+		*height = 320;
+		break;
+	case NDI_RESOLUTION_480_SQUARE:
+		*width = 480;
+		*height = 480;
+		break;
+	case NDI_RESOLUTION_640_SQUARE:
+		*width = 640;
+		*height = 640;
+		break;
 	case NDI_RESOLUTION_720P:
 		*width = 1280;
 		*height = 720;

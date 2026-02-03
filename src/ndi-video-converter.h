@@ -27,7 +27,11 @@
 
 // Resolution conversion mode
 enum ndi_resolution_mode {
-	NDI_RESOLUTION_AUTO = 0,     // Use source resolution
+	NDI_RESOLUTION_AUTO = 0,      // Use source resolution
+	NDI_RESOLUTION_240_SQUARE,    // 240x240
+	NDI_RESOLUTION_320_SQUARE,    // 320x320
+	NDI_RESOLUTION_480_SQUARE,    // 480x480
+	NDI_RESOLUTION_640_SQUARE,    // 640x640
 	NDI_RESOLUTION_720P,          // 1280x720
 	NDI_RESOLUTION_1080P,         // 1920x1080
 	NDI_RESOLUTION_1440P,         // 2560x1440

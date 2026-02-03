@@ -58,6 +58,16 @@ extern "C" {
 // FEC
 #define GAZE_FEC_DEFAULT_PERCENT 20
 #define GAZE_FEC_MAX_PERCENT 50
+
+// Quality Presets (bitrate in kbps, FEC in percent)
+#define GAZE_PRESET_ULTRA_BITRATE 25000
+#define GAZE_PRESET_ULTRA_FEC 10
+#define GAZE_PRESET_HIGH_BITRATE 15000
+#define GAZE_PRESET_HIGH_FEC 15
+#define GAZE_PRESET_BALANCED_BITRATE 10000
+#define GAZE_PRESET_BALANCED_FEC 20
+#define GAZE_PRESET_LOW_BITRATE 5000
+#define GAZE_PRESET_LOW_FEC 25
 #define GAZE_FEC_MAX_SHARDS 255
 #define GAZE_FEC_MAX_BLOCKS_PER_FRAME 4
 #define GAZE_FEC_SHARD_SIZE (GAZE_MAX_PAYLOAD_SIZE - 28) // MTU - headers
@@ -191,6 +201,32 @@ typedef struct gaze_rtcp_header {
 // RTCP packet types
 #define GAZE_RTCP_SR 200  // Sender Report
 #define GAZE_RTCP_RR 201  // Receiver Report
+
+// ============================================================================
+// Receiver Subscription Protocol
+// ============================================================================
+
+// Control message magic bytes
+#define GAZE_CTRL_MAGIC_0    'G'
+#define GAZE_CTRL_MAGIC_1    'Z'
+
+// Control message types (sent by receiver to sender on RTCP port)
+#define GAZE_CTRL_SUBSCRIBE   0x01  // Receiver wants to receive stream
+#define GAZE_CTRL_HEARTBEAT   0x02  // Receiver still alive (sent periodically)
+#define GAZE_CTRL_UNSUBSCRIBE 0x03  // Receiver stopping
+
+// Timing constants
+#define GAZE_HEARTBEAT_INTERVAL_MS 1000                   // Receiver sends every 1s
+#define GAZE_RECEIVER_TIMEOUT_NS   (5ULL * 1000000000ULL) // 5 seconds without heartbeat
+
+// Receiver list limits
+#define GAZE_MAX_RECEIVERS 8
+
+// Fixed port assignment: port = GAZE_BASE_PORT + (output_index * 2)
+// Output 1: 5960 (RTP), 5961 (RTCP/control)
+// Output 2: 5962 (RTP), 5963 (RTCP/control)
+// etc.
+#define GAZE_BASE_PORT 5960
 
 // ============================================================================
 // Helper Macros

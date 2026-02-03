@@ -32,6 +32,99 @@ static void build_prop_name(char *buf, size_t size, int index, const char *suffi
 	snprintf(buf, size, "gaze_output_%d_%s", index + 1, suffix);
 }
 
+//
+// Calculate crop top-left coordinates from reference point settings
+// Converts reference-based positioning to traditional top-left coordinates
+//
+static void calculate_crop_topleft(gaze_output_t *out, uint32_t source_w, uint32_t source_h,
+				   int32_t *out_left, int32_t *out_top,
+				   uint32_t *out_width, uint32_t *out_height)
+{
+	// Get crop dimensions (convert percentage if needed)
+	uint32_t w, h;
+	int32_t ref_x, ref_y;
+
+	if (out->crop_type == GAZE_CROP_TYPE_PERCENTAGE) {
+		w = (uint32_t)(out->crop_w_pct / 100.0 * source_w);
+		h = (uint32_t)(out->crop_h_pct / 100.0 * source_h);
+		ref_x = (int32_t)(out->crop_ref_x_pct / 100.0 * source_w);
+		ref_y = (int32_t)(out->crop_ref_y_pct / 100.0 * source_h);
+	} else {
+		w = out->crop_w;
+		h = out->crop_h;
+		ref_x = out->crop_ref_x;
+		ref_y = out->crop_ref_y;
+	}
+
+	// Handle zero width/height as full source dimension
+	if (w == 0)
+		w = source_w;
+	if (h == 0)
+		h = source_h;
+
+	// Convert reference point to top-left
+	int32_t left = 0, top = 0;
+
+	switch (out->crop_reference) {
+	case GAZE_CROP_REF_TOP_LEFT:
+		left = ref_x;
+		top = ref_y;
+		break;
+	case GAZE_CROP_REF_TOP_CENTER:
+		left = ref_x - (int32_t)(w / 2);
+		top = ref_y;
+		break;
+	case GAZE_CROP_REF_TOP_RIGHT:
+		left = ref_x - (int32_t)w;
+		top = ref_y;
+		break;
+	case GAZE_CROP_REF_CENTER_LEFT:
+		left = ref_x;
+		top = ref_y - (int32_t)(h / 2);
+		break;
+	case GAZE_CROP_REF_CENTER:
+		left = ref_x - (int32_t)(w / 2);
+		top = ref_y - (int32_t)(h / 2);
+		break;
+	case GAZE_CROP_REF_CENTER_RIGHT:
+		left = ref_x - (int32_t)w;
+		top = ref_y - (int32_t)(h / 2);
+		break;
+	case GAZE_CROP_REF_BOTTOM_LEFT:
+		left = ref_x;
+		top = ref_y - (int32_t)h;
+		break;
+	case GAZE_CROP_REF_BOTTOM_CENTER:
+		left = ref_x - (int32_t)(w / 2);
+		top = ref_y - (int32_t)h;
+		break;
+	case GAZE_CROP_REF_BOTTOM_RIGHT:
+		left = ref_x - (int32_t)w;
+		top = ref_y - (int32_t)h;
+		break;
+	}
+
+	// Clamp to valid range (ensure crop zone stays within source bounds)
+	if (left < 0)
+		left = 0;
+	if (top < 0)
+		top = 0;
+	if ((uint32_t)left + w > source_w)
+		left = (int32_t)(source_w - w);
+	if ((uint32_t)top + h > source_h)
+		top = (int32_t)(source_h - h);
+	// Final safety clamp in case dimensions exceed source
+	if (left < 0)
+		left = 0;
+	if (top < 0)
+		top = 0;
+
+	*out_left = left;
+	*out_top = top;
+	*out_width = w;
+	*out_height = h;
+}
+
 // Forward declarations
 static void gaze_filter_update(void *data, obs_data_t *settings);
 static bool output_init_components(gaze_output_t *out, gaze_filter_t *f);
@@ -45,11 +138,16 @@ static void gaze_output_raw_video(void *data, struct video_data *frame)
 	if (!out || !out->enabled || !out->parent || !out->components_initialized)
 		return;
 
+	gaze_filter_t *f = out->parent;
+
+	// Convert OBS frame timestamp to wall clock for latency measurement
+	// frame->timestamp is closer to actual capture time than current wall clock
+	int64_t obs_ts_ms = (int64_t)(frame->timestamp / 1000000);
+	uint32_t capture_ts_ms = (uint32_t)(obs_ts_ms + f->timestamp_offset_ms);
+
 	// Reduce logging overhead - only log every 300 frames (5 seconds at 60fps)
 	static int raw_video_count = 0;
 	raw_video_count++;
-
-	gaze_filter_t *f = out->parent;
 
 	// FPS gating
 	int frames_to_send = 1;
@@ -100,15 +198,9 @@ static void gaze_output_raw_video(void *data, struct video_data *frame)
 			gaze_packetizer_get_frame_index(&out->packetizer));
 	}
 
-	// Packetize
+	// Packetize (using capture_ts_ms from start of processing)
 	gaze_packet_t *packets = nullptr;
 	size_t packet_count = 0;
-	// Use wall clock time for latency measurement (not OBS relative timestamp)
-	auto now = std::chrono::system_clock::now();
-	uint32_t capture_ts_ms = (uint32_t)(
-		std::chrono::duration_cast<std::chrono::milliseconds>(
-			now.time_since_epoch())
-			.count());
 
 	if (!gaze_packetizer_packetize(&out->packetizer, encoded_data,
 				       encoded_size, is_keyframe, capture_ts_ms,
@@ -193,15 +285,36 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 				  uint32_t width, uint32_t height,
 				  uint64_t timestamp)
 {
+	// Convert OBS timestamp to wall clock for latency measurement
+	// OBS timestamp is closer to actual frame capture time than current wall clock
+	// timestamp (ns) -> ms, then add offset to convert to wall clock
+	int64_t obs_ts_ms = (int64_t)(timestamp / 1000000);
+	uint32_t capture_ts_ms = (uint32_t)(obs_ts_ms + f->timestamp_offset_ms);
+
 	// Determine render dimensions
 	uint32_t render_width = width;
 	uint32_t render_height = height;
 
-	// First, ensure crop cache is valid if crop is enabled
-	if (out->converter.enable_crop && !out->converter.crop_cache_valid) {
-		// Use source dimensions for initial crop cache calculation
-		ndi_converter_update_crop_cache(&out->converter, width, height,
-						width, height);
+	// Calculate crop coordinates from reference point if crop is enabled
+	if (out->converter.enable_crop) {
+		// Calculate top-left coordinates from reference point settings
+		int32_t crop_left, crop_top;
+		uint32_t crop_w, crop_h;
+		calculate_crop_topleft(out, width, height,
+				       &crop_left, &crop_top, &crop_w, &crop_h);
+
+		// Update converter's crop settings with calculated values
+		out->converter.crop_left = crop_left;
+		out->converter.crop_top = crop_top;
+		out->converter.crop_width = crop_w;
+		out->converter.crop_height = crop_h;
+
+		// Update crop cache directly
+		out->converter.cached_crop_left = crop_left;
+		out->converter.cached_crop_top = crop_top;
+		out->converter.cached_crop_width = crop_w;
+		out->converter.cached_crop_height = crop_h;
+		out->converter.crop_cache_valid = true;
 	}
 
 	if (out->converter.enable_custom_resolution &&
@@ -251,19 +364,23 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 		out->keyframe_requested = true;
 		pthread_mutex_unlock(&out->output_mutex);
 
-		// Update discovery
-		gaze_discovery_update(&out->discovery, render_width,
-				      render_height, fps_num / fps_den);
+		// Register or update discovery (on selected network interface)
+		if (!out->discovery.registered) {
+			gaze_discovery_register(&out->discovery, out->stream_name,
+						out->rtp_port, f->codec,
+						render_width, render_height,
+						fps_num / fps_den,
+						f->network_if_index);
+		} else {
+			gaze_discovery_update(&out->discovery, render_width,
+					      render_height, fps_num / fps_den);
+		}
 
 		out->known_width = render_width;
 		out->known_height = render_height;
-		ndi_converter_update_crop_cache(&out->converter, width, height,
-						render_width, render_height);
-	} else if (out->converter.enable_crop &&
-		   !out->converter.crop_cache_valid) {
-		ndi_converter_update_crop_cache(&out->converter, width, height,
-						render_width, render_height);
+		// Note: crop cache was already updated by calculate_crop_topleft above
 	}
+	// Note: crop cache was already updated by calculate_crop_topleft above
 
 	// Ensure video_output exists
 	if (!out->video_output) {
@@ -338,16 +455,9 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 				out->video_linesize, &encoded_data,
 				&encoded_size, &is_keyframe) &&
 	    encoded_size > 0) {
-		// Packetize and send
+		// Packetize and send (using capture_ts_ms from start of processing)
 		gaze_packet_t *packets = nullptr;
 		size_t packet_count = 0;
-
-		// Wall clock timestamp for latency measurement
-		auto now = std::chrono::system_clock::now();
-		uint32_t capture_ts_ms = (uint32_t)(
-			std::chrono::duration_cast<std::chrono::milliseconds>(
-				now.time_since_epoch())
-				.count());
 
 		if (gaze_packetizer_packetize(&out->packetizer, encoded_data,
 					      encoded_size, is_keyframe,
@@ -500,19 +610,14 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 {
 	pthread_mutex_lock(&out->output_mutex);
 
-	// Initialize sender
-	if (!gaze_sender_init(&out->sender, out->target_host, out->base_port,
-			      out->multicast)) {
+	// Initialize sender with receiver-initiated subscription
+	// Pass bind_addr for network interface binding
+	if (!gaze_sender_init(&out->sender, out->rtp_port, f->network_bind_addr)) {
 		obs_log(LOG_ERROR,
 			"[gaze-filter] Failed to init sender for output %d",
 			out->output_index + 1);
 		pthread_mutex_unlock(&out->output_mutex);
 		return false;
-	}
-
-	// For unicast, assume receiver is present
-	if (!out->multicast) {
-		gaze_sender_assume_receiver(&out->sender);
 	}
 
 	// Initialize packetizer
@@ -533,6 +638,12 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 	// Initialize discovery
 	gaze_discovery_init(&out->discovery);
 
+	// Register mDNS immediately so receivers can discover us
+	// Use 0x0 dimensions initially - will be updated when we know actual size
+	gaze_discovery_register(&out->discovery, out->stream_name,
+				out->rtp_port, f->codec, 0, 0, 0,
+				f->network_if_index);
+
 	// Request a keyframe at startup so new receivers can decode immediately
 	out->keyframe_requested = true;
 
@@ -541,9 +652,8 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 	pthread_mutex_unlock(&out->output_mutex);
 
 	obs_log(LOG_INFO,
-		"[gaze-filter] Output %d initialized: %s -> %s:%d (%s)",
-		out->output_index + 1, out->stream_name,
-		out->multicast ? "multicast" : out->target_host, out->base_port,
+		"[gaze-filter] Output %d initialized: %s on port %d (%s)",
+		out->output_index + 1, out->stream_name, out->rtp_port,
 		gaze_codec_name(f->codec));
 
 	return true;
@@ -568,90 +678,230 @@ static void add_output_properties(obs_properties_t *props, int index)
 				obs_module_text("GazePlugin.StreamName"),
 				OBS_TEXT_DEFAULT);
 
-	build_prop_name(prop_name, sizeof(prop_name), index, "multicast");
-	obs_properties_add_bool(group, prop_name,
-				obs_module_text("GazePlugin.Multicast"));
-
-	build_prop_name(prop_name, sizeof(prop_name), index, "target_host");
-	obs_properties_add_text(group, prop_name,
-				obs_module_text("GazePlugin.TargetHost"),
-				OBS_TEXT_DEFAULT);
-
-	build_prop_name(prop_name, sizeof(prop_name), index, "base_port");
-	obs_properties_add_int(group, prop_name,
-			       obs_module_text("GazePlugin.BasePort"), 1024,
-			       65535, 1);
-
-	// Resolution
+	// Resolution group
+	char grp[64];
 	obs_properties_t *group_res = obs_properties_create();
-	build_prop_name(prop_name, sizeof(prop_name), index,
-			"enable_custom_resolution");
-	obs_properties_add_bool(group_res, prop_name, "Enable Custom Resolution");
-
-	build_prop_name(prop_name, sizeof(prop_name), index, "resolution_mode");
-	auto res_mode = obs_properties_add_list(group_res, prop_name,
-						"Resolution Preset",
-						OBS_COMBO_TYPE_LIST,
-						OBS_COMBO_FORMAT_INT);
+	char res_mode_name[128];
+	build_prop_name(res_mode_name, sizeof(res_mode_name), index, "resolution_mode");
+	auto res_mode =
+		obs_properties_add_list(group_res, res_mode_name, "Preset",
+					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(res_mode, "Auto (Source)", -1);
+	obs_property_list_add_int(res_mode, "240x240", NDI_RESOLUTION_240_SQUARE);
+	obs_property_list_add_int(res_mode, "320x320", NDI_RESOLUTION_320_SQUARE);
+	obs_property_list_add_int(res_mode, "480x480", NDI_RESOLUTION_480_SQUARE);
+	obs_property_list_add_int(res_mode, "640x640", NDI_RESOLUTION_640_SQUARE);
 	obs_property_list_add_int(res_mode, "720p", NDI_RESOLUTION_720P);
 	obs_property_list_add_int(res_mode, "1080p", NDI_RESOLUTION_1080P);
 	obs_property_list_add_int(res_mode, "1440p", NDI_RESOLUTION_1440P);
 	obs_property_list_add_int(res_mode, "4K", NDI_RESOLUTION_4K);
 	obs_property_list_add_int(res_mode, "Custom", NDI_RESOLUTION_CUSTOM);
 
+	// Custom resolution fields (only visible when Custom selected)
 	build_prop_name(prop_name, sizeof(prop_name), index, "custom_width");
 	obs_properties_add_int(group_res, prop_name, "Width", 128, 7680, 1);
 	build_prop_name(prop_name, sizeof(prop_name), index, "custom_height");
 	obs_properties_add_int(group_res, prop_name, "Height", 72, 4320, 1);
 
-	char grp[64];
-	snprintf(grp, sizeof(grp), "gaze_output_%d_res", index + 1);
-	obs_properties_add_group(group, grp, "Resolution", OBS_GROUP_NORMAL,
-				 group_res);
+	snprintf(grp, sizeof(grp), "gaze_output_%d_resolution", index + 1);
+	obs_properties_add_group(group, grp, "Resolution",
+				 OBS_GROUP_NORMAL, group_res);
+
+	// Show/hide custom resolution fields based on dropdown selection
+	obs_property_set_modified_callback2(
+		res_mode,
+		[](void *priv, obs_properties_t *props, obs_property_t *,
+		   obs_data_t *settings) {
+			int idx = (int)(intptr_t)priv;
+			char mode_prop[128], w_prop[128], h_prop[128];
+			snprintf(mode_prop, sizeof(mode_prop),
+				 "gaze_output_%d_resolution_mode", idx + 1);
+			snprintf(w_prop, sizeof(w_prop),
+				 "gaze_output_%d_custom_width", idx + 1);
+			snprintf(h_prop, sizeof(h_prop),
+				 "gaze_output_%d_custom_height", idx + 1);
+			int mode = (int)obs_data_get_int(settings, mode_prop);
+			bool is_custom = (mode == NDI_RESOLUTION_CUSTOM);
+			obs_property_set_visible(obs_properties_get(props, w_prop),
+						 is_custom);
+			obs_property_set_visible(obs_properties_get(props, h_prop),
+						 is_custom);
+			return true;
+		},
+		(void *)(intptr_t)index);
 
 	// Crop
 	obs_properties_t *group_crop = obs_properties_create();
 	build_prop_name(prop_name, sizeof(prop_name), index, "enable_crop");
-	obs_properties_add_bool(group_crop, prop_name, "Enable Crop");
+	obs_properties_add_bool(group_crop, prop_name,
+				obs_module_text("GazePlugin.CropEnable"));
 
-	build_prop_name(prop_name, sizeof(prop_name), index, "crop_left");
-	obs_properties_add_int(group_crop, prop_name, "Left", 0, 7680, 1);
-	build_prop_name(prop_name, sizeof(prop_name), index, "crop_top");
-	obs_properties_add_int(group_crop, prop_name, "Top", 0, 4320, 1);
-	build_prop_name(prop_name, sizeof(prop_name), index, "crop_width");
-	obs_properties_add_int(group_crop, prop_name, "Width (0=full)", 0, 7680,
-			       1);
-	build_prop_name(prop_name, sizeof(prop_name), index, "crop_height");
-	obs_properties_add_int(group_crop, prop_name, "Height (0=full)", 0,
-			       4320, 1);
+	// Type dropdown (Pixel / Percentage)
+	char crop_type_name[128];
+	build_prop_name(crop_type_name, sizeof(crop_type_name), index, "crop_type");
+	auto crop_type_list = obs_properties_add_list(
+		group_crop, crop_type_name,
+		obs_module_text("GazePlugin.CropType"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(crop_type_list,
+				  obs_module_text("GazePlugin.CropType.Pixel"),
+				  GAZE_CROP_TYPE_PIXEL);
+	obs_property_list_add_int(crop_type_list,
+				  obs_module_text("GazePlugin.CropType.Percentage"),
+				  GAZE_CROP_TYPE_PERCENTAGE);
+
+	// Reference point dropdown (9 options)
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_reference");
+	auto ref_list = obs_properties_add_list(
+		group_crop, prop_name,
+		obs_module_text("GazePlugin.CropReference"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.TopLeft"),
+				  GAZE_CROP_REF_TOP_LEFT);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.TopCenter"),
+				  GAZE_CROP_REF_TOP_CENTER);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.TopRight"),
+				  GAZE_CROP_REF_TOP_RIGHT);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.CenterLeft"),
+				  GAZE_CROP_REF_CENTER_LEFT);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.Center"),
+				  GAZE_CROP_REF_CENTER);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.CenterRight"),
+				  GAZE_CROP_REF_CENTER_RIGHT);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.BottomLeft"),
+				  GAZE_CROP_REF_BOTTOM_LEFT);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.BottomCenter"),
+				  GAZE_CROP_REF_BOTTOM_CENTER);
+	obs_property_list_add_int(ref_list,
+				  obs_module_text("GazePlugin.CropRef.BottomRight"),
+				  GAZE_CROP_REF_BOTTOM_RIGHT);
+
+	// Pixel crop sub-group - NUMBER INPUTS
+	obs_properties_t *pixel_crop = obs_properties_create();
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_ref_x");
+	obs_properties_add_int(pixel_crop, prop_name,
+			       obs_module_text("GazePlugin.CropRefX"),
+			       0, 7680, 1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_ref_y");
+	obs_properties_add_int(pixel_crop, prop_name,
+			       obs_module_text("GazePlugin.CropRefY"),
+			       0, 4320, 1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_w");
+	obs_properties_add_int(pixel_crop, prop_name,
+			       obs_module_text("GazePlugin.CropWidth"),
+			       0, 7680, 1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_h");
+	obs_properties_add_int(pixel_crop, prop_name,
+			       obs_module_text("GazePlugin.CropHeight"),
+			       0, 4320, 1);
+	snprintf(grp, sizeof(grp), "gaze_output_%d_crop_pixel", index + 1);
+	obs_properties_add_group(group_crop, grp,
+				 obs_module_text("GazePlugin.CropPixelValues"),
+				 OBS_GROUP_NORMAL, pixel_crop);
+
+	// Percentage crop sub-group - SLIDERS (0-100%)
+	obs_properties_t *pct_crop = obs_properties_create();
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_ref_x_pct");
+	obs_properties_add_float_slider(pct_crop, prop_name,
+					obs_module_text("GazePlugin.CropRefX"),
+					0, 100, 0.1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_ref_y_pct");
+	obs_properties_add_float_slider(pct_crop, prop_name,
+					obs_module_text("GazePlugin.CropRefY"),
+					0, 100, 0.1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_w_pct");
+	obs_properties_add_float_slider(pct_crop, prop_name,
+					obs_module_text("GazePlugin.CropWidth"),
+					0, 100, 0.1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "crop_h_pct");
+	obs_properties_add_float_slider(pct_crop, prop_name,
+					obs_module_text("GazePlugin.CropHeight"),
+					0, 100, 0.1);
+	snprintf(grp, sizeof(grp), "gaze_output_%d_crop_pct", index + 1);
+	obs_properties_add_group(group_crop, grp,
+				 obs_module_text("GazePlugin.CropPctValues"),
+				 OBS_GROUP_NORMAL, pct_crop);
+
+	// Visibility callback - SHOW/HIDE based on Type selection
+	obs_property_set_modified_callback2(
+		crop_type_list,
+		[](void *priv, obs_properties_t *props, obs_property_t *,
+		   obs_data_t *settings) {
+			int idx = (int)(intptr_t)priv;
+			char type_prop[128], pixel_grp[64], pct_grp[64];
+			snprintf(type_prop, sizeof(type_prop),
+				 "gaze_output_%d_crop_type", idx + 1);
+			snprintf(pixel_grp, sizeof(pixel_grp),
+				 "gaze_output_%d_crop_pixel", idx + 1);
+			snprintf(pct_grp, sizeof(pct_grp),
+				 "gaze_output_%d_crop_pct", idx + 1);
+
+			int type = (int)obs_data_get_int(settings, type_prop);
+			bool is_pixel = (type == GAZE_CROP_TYPE_PIXEL);
+
+			// Show pixel group when Pixel selected, hide percentage group
+			obs_property_set_visible(
+				obs_properties_get(props, pixel_grp), is_pixel);
+			// Show percentage group when Percentage selected
+			obs_property_set_visible(
+				obs_properties_get(props, pct_grp), !is_pixel);
+
+			return true;
+		},
+		(void *)(intptr_t)index);
 
 	snprintf(grp, sizeof(grp), "gaze_output_%d_crop", index + 1);
-	obs_properties_add_group(group, grp, "Crop", OBS_GROUP_NORMAL,
-				 group_crop);
+	obs_properties_add_group(group, grp,
+				 obs_module_text("GazePlugin.Crop"),
+				 OBS_GROUP_NORMAL, group_crop);
 
-	// FPS
+	// Frame Rate group
 	obs_properties_t *group_fps = obs_properties_create();
-	build_prop_name(prop_name, sizeof(prop_name), index,
-			"enable_custom_framerate");
-	obs_properties_add_bool(group_fps, prop_name, "Enable Custom FPS");
-
-	build_prop_name(prop_name, sizeof(prop_name), index, "framerate_mode");
-	auto fps_mode = obs_properties_add_list(group_fps, prop_name,
-						"FPS Preset", OBS_COMBO_TYPE_LIST,
-						OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(fps_mode, "5", NDI_FRAMERATE_5);
-	obs_property_list_add_int(fps_mode, "10", NDI_FRAMERATE_10);
-	obs_property_list_add_int(fps_mode, "15", NDI_FRAMERATE_15);
-	obs_property_list_add_int(fps_mode, "30", NDI_FRAMERATE_30);
-	obs_property_list_add_int(fps_mode, "60", NDI_FRAMERATE_60);
+	char fps_mode_name[128];
+	build_prop_name(fps_mode_name, sizeof(fps_mode_name), index, "framerate_mode");
+	auto fps_mode =
+		obs_properties_add_list(group_fps, fps_mode_name, "Preset",
+					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(fps_mode, "Auto (Source)", -1);
+	obs_property_list_add_int(fps_mode, "15 fps", NDI_FRAMERATE_15);
+	obs_property_list_add_int(fps_mode, "30 fps", NDI_FRAMERATE_30);
+	obs_property_list_add_int(fps_mode, "60 fps", NDI_FRAMERATE_60);
 	obs_property_list_add_int(fps_mode, "Custom", NDI_FRAMERATE_CUSTOM);
 
+	// Custom FPS field (only visible when Custom selected)
 	build_prop_name(prop_name, sizeof(prop_name), index, "custom_fps");
-	obs_properties_add_int(group_fps, prop_name, "Custom FPS", 1, 240, 1);
+	obs_properties_add_int(group_fps, prop_name, "FPS", 1, 240, 1);
 
-	snprintf(grp, sizeof(grp), "gaze_output_%d_fps", index + 1);
-	obs_properties_add_group(group, grp, "Frame Rate", OBS_GROUP_NORMAL,
-				 group_fps);
+	snprintf(grp, sizeof(grp), "gaze_output_%d_framerate", index + 1);
+	obs_properties_add_group(group, grp, "Frame Rate",
+				 OBS_GROUP_NORMAL, group_fps);
+
+	// Show/hide custom FPS based on dropdown selection
+	obs_property_set_modified_callback2(
+		fps_mode,
+		[](void *priv, obs_properties_t *props, obs_property_t *,
+		   obs_data_t *settings) {
+			int idx = (int)(intptr_t)priv;
+			char mode_prop[128], fps_prop[128];
+			snprintf(mode_prop, sizeof(mode_prop),
+				 "gaze_output_%d_framerate_mode", idx + 1);
+			snprintf(fps_prop, sizeof(fps_prop),
+				 "gaze_output_%d_custom_fps", idx + 1);
+			int mode = (int)obs_data_get_int(settings, mode_prop);
+			bool is_custom = (mode == NDI_FRAMERATE_CUSTOM);
+			obs_property_set_visible(obs_properties_get(props, fps_prop),
+						 is_custom);
+			return true;
+		},
+		(void *)(intptr_t)index);
 
 	snprintf(grp, sizeof(grp), "gaze_output_%d", index + 1);
 	snprintf(label, sizeof(label), "Output %d", index + 1);
@@ -687,21 +937,118 @@ static obs_properties_t *gaze_filter_getproperties(void *)
 	obs_property_list_add_int(encoder_list, "Software (CPU)",
 				  GAZE_ENCODER_SOFTWARE);
 
-	obs_properties_add_int(props, "gaze_bitrate",
-			       obs_module_text("GazePlugin.Bitrate"),
-			       GAZE_MIN_BITRATE_KBPS, GAZE_MAX_BITRATE_KBPS,
-			       1000);
+	// Quality preset (combines bitrate + FEC)
+	auto quality_list = obs_properties_add_list(
+		props, "gaze_quality_preset",
+		obs_module_text("GazePlugin.QualityPreset"), OBS_COMBO_TYPE_LIST,
+		OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(quality_list, "Ultra (25 Mbps) - Best quality",
+				  0);
+	obs_property_list_add_int(quality_list, "High (15 Mbps) - Great quality",
+				  1);
+	obs_property_list_add_int(quality_list,
+				  "Balanced (10 Mbps) - WiFi friendly", 2);
+	obs_property_list_add_int(quality_list,
+				  "Low (5 Mbps) - Save bandwidth", 3);
+	obs_property_list_add_int(quality_list, "Custom...", 4);
 
-	obs_properties_add_int(props, "gaze_fec_percent",
-			       obs_module_text("GazePlugin.FECPercent"), 0,
-			       GAZE_FEC_MAX_PERCENT, 5);
+	// Custom bitrate/FEC (only shown when Custom is selected)
+	auto bitrate_prop = obs_properties_add_int(
+		props, "gaze_bitrate", obs_module_text("GazePlugin.Bitrate"),
+		GAZE_MIN_BITRATE_KBPS, GAZE_MAX_BITRATE_KBPS, 1000);
+
+	auto fec_prop = obs_properties_add_int(
+		props, "gaze_fec_percent",
+		obs_module_text("GazePlugin.FECPercent"), 0, GAZE_FEC_MAX_PERCENT,
+		5);
+
+	// Show/hide custom controls based on preset selection
+	obs_property_set_modified_callback2(
+		quality_list,
+		[](void *, obs_properties_t *props, obs_property_t *,
+		   obs_data_t *settings) {
+			int preset = (int)obs_data_get_int(settings,
+							   "gaze_quality_preset");
+			bool is_custom = (preset == 4);
+			obs_property_set_visible(
+				obs_properties_get(props, "gaze_bitrate"),
+				is_custom);
+			obs_property_set_visible(
+				obs_properties_get(props, "gaze_fec_percent"),
+				is_custom);
+			return true;
+		},
+		nullptr);
+
+	// Set initial visibility
+	obs_property_set_visible(bitrate_prop, false);
+	obs_property_set_visible(fec_prop, false);
 
 	obs_properties_add_bool(props, "stop_when_inactive",
 				obs_module_text("GazePlugin.StopWhenInactive"));
 
+	// Network interface selection
+	auto net_list = obs_properties_add_list(
+		props, "gaze_network_interface",
+		obs_module_text("GazePlugin.NetworkInterface"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+
+	// Add "Auto (Primary)" option first
+	obs_property_list_add_string(net_list, "Auto (Primary Network)", "");
+
+	// Enumerate network interfaces
+	gaze_network_list_t net_interfaces;
+	if (gaze_network_get_interfaces(&net_interfaces)) {
+		for (int i = 0; i < net_interfaces.count; i++) {
+			const gaze_network_interface_t *iface =
+				&net_interfaces.interfaces[i];
+			// Build display string: "Name (IP)"
+			char display[128];
+			if (iface->is_primary) {
+				snprintf(display, sizeof(display),
+					 "%s (%s) [Primary]", iface->name,
+					 iface->ip);
+			} else {
+				snprintf(display, sizeof(display), "%s (%s)",
+					 iface->name, iface->ip);
+			}
+			obs_property_list_add_string(net_list, display,
+						     iface->ip);
+		}
+	}
+
+	// Number of outputs selector
+	auto output_count = obs_properties_add_list(
+		props, "gaze_output_count",
+		obs_module_text("GazePlugin.OutputCount"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	for (int i = 1; i <= MAX_GAZE_OUTPUTS; i++) {
+		char label[16];
+		snprintf(label, sizeof(label), "%d", i);
+		obs_property_list_add_int(output_count, label, i);
+	}
+
 	// Per-output settings
 	for (int i = 0; i < MAX_GAZE_OUTPUTS; i++)
 		add_output_properties(props, i);
+
+	// Show/hide output groups based on output count
+	obs_property_set_modified_callback2(
+		output_count,
+		[](void *, obs_properties_t *props, obs_property_t *,
+		   obs_data_t *settings) {
+			int count = (int)obs_data_get_int(settings, "gaze_output_count");
+			for (int i = 0; i < MAX_GAZE_OUTPUTS; i++) {
+				char grp_name[64];
+				snprintf(grp_name, sizeof(grp_name),
+					 "gaze_output_%d", i + 1);
+				obs_property_set_visible(
+					obs_properties_get(props, grp_name),
+					i < count);
+			}
+			return true;
+		},
+		nullptr);
 
 	// Apply button
 	obs_properties_add_button(
@@ -732,26 +1079,43 @@ static void set_output_defaults(obs_data_t *d, int i)
 	snprintf(name, sizeof(name), "Gaze Stream %d", i + 1);
 	obs_data_set_default_string(d, p, name);
 
-	build_prop_name(p, sizeof(p), i, "multicast");
-	obs_data_set_default_bool(d, p, false);
-
-	build_prop_name(p, sizeof(p), i, "target_host");
-	obs_data_set_default_string(d, p, "");
-
-	build_prop_name(p, sizeof(p), i, "base_port");
-	obs_data_set_default_int(d, p, GAZE_DEFAULT_RTP_PORT + i * 2);
-
 	build_prop_name(p, sizeof(p), i, "resolution_mode");
-	obs_data_set_default_int(d, p, NDI_RESOLUTION_1080P);
+	obs_data_set_default_int(d, p, -1); // Auto (Source)
 	build_prop_name(p, sizeof(p), i, "custom_width");
 	obs_data_set_default_int(d, p, 1920);
 	build_prop_name(p, sizeof(p), i, "custom_height");
 	obs_data_set_default_int(d, p, 1080);
 
+	// Crop defaults
+	build_prop_name(p, sizeof(p), i, "enable_crop");
+	obs_data_set_default_bool(d, p, false);
+	build_prop_name(p, sizeof(p), i, "crop_type");
+	obs_data_set_default_int(d, p, GAZE_CROP_TYPE_PIXEL);
+	build_prop_name(p, sizeof(p), i, "crop_reference");
+	obs_data_set_default_int(d, p, GAZE_CROP_REF_TOP_LEFT);
+	// Pixel crop defaults
+	build_prop_name(p, sizeof(p), i, "crop_ref_x");
+	obs_data_set_default_int(d, p, 0);
+	build_prop_name(p, sizeof(p), i, "crop_ref_y");
+	obs_data_set_default_int(d, p, 0);
+	build_prop_name(p, sizeof(p), i, "crop_w");
+	obs_data_set_default_int(d, p, 0); // 0 = full width
+	build_prop_name(p, sizeof(p), i, "crop_h");
+	obs_data_set_default_int(d, p, 0); // 0 = full height
+	// Percentage crop defaults
+	build_prop_name(p, sizeof(p), i, "crop_ref_x_pct");
+	obs_data_set_default_double(d, p, 50.0);
+	build_prop_name(p, sizeof(p), i, "crop_ref_y_pct");
+	obs_data_set_default_double(d, p, 50.0);
+	build_prop_name(p, sizeof(p), i, "crop_w_pct");
+	obs_data_set_default_double(d, p, 100.0);
+	build_prop_name(p, sizeof(p), i, "crop_h_pct");
+	obs_data_set_default_double(d, p, 100.0);
+
 	build_prop_name(p, sizeof(p), i, "framerate_mode");
-	obs_data_set_default_int(d, p, NDI_FRAMERATE_30);
+	obs_data_set_default_int(d, p, -1); // Auto (Source)
 	build_prop_name(p, sizeof(p), i, "custom_fps");
-	obs_data_set_default_int(d, p, 30);
+	obs_data_set_default_int(d, p, 60);
 }
 
 //
@@ -761,9 +1125,12 @@ static void gaze_filter_getdefaults(obs_data_t *d)
 {
 	obs_data_set_default_int(d, "gaze_codec", GAZE_CODEC_HEVC);
 	obs_data_set_default_int(d, "gaze_encoder_type", GAZE_ENCODER_AUTO);
-	obs_data_set_default_int(d, "gaze_bitrate", GAZE_DEFAULT_BITRATE_KBPS);
-	obs_data_set_default_int(d, "gaze_fec_percent", GAZE_FEC_DEFAULT_PERCENT);
+	obs_data_set_default_int(d, "gaze_quality_preset", 1); // High (15 Mbps)
+	obs_data_set_default_int(d, "gaze_bitrate", GAZE_PRESET_HIGH_BITRATE);
+	obs_data_set_default_int(d, "gaze_fec_percent", GAZE_PRESET_HIGH_FEC);
 	obs_data_set_default_bool(d, "stop_when_inactive", true);
+	obs_data_set_default_string(d, "gaze_network_interface", ""); // Auto (Primary)
+	obs_data_set_default_int(d, "gaze_output_count", 1); // Default to 1 output
 
 	for (int i = 0; i < MAX_GAZE_OUTPUTS; i++)
 		set_output_defaults(d, i);
@@ -798,45 +1165,64 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 	strncpy(out->stream_name, obs_data_get_string(s, p),
 		sizeof(out->stream_name) - 1);
 
-	build_prop_name(p, sizeof(p), i, "multicast");
-	out->multicast = obs_data_get_bool(s, p);
-
-	build_prop_name(p, sizeof(p), i, "target_host");
-	strncpy(out->target_host, obs_data_get_string(s, p),
-		sizeof(out->target_host) - 1);
-
-	build_prop_name(p, sizeof(p), i, "base_port");
-	out->base_port = (uint16_t)obs_data_get_int(s, p);
+	// Fixed port assignment: GAZE_BASE_PORT + (output_index * 2)
+	out->rtp_port = GAZE_BASE_PORT + (i * 2);
 
 	// Build converter settings
 	obs_data_t *cs = obs_data_create();
 
-	build_prop_name(p, sizeof(p), i, "enable_custom_resolution");
-	obs_data_set_bool(cs, "enable_custom_resolution",
-			  obs_data_get_bool(s, p));
+	// Resolution: -1 = Auto (disabled), otherwise use the mode
 	build_prop_name(p, sizeof(p), i, "resolution_mode");
-	obs_data_set_int(cs, "resolution_mode", obs_data_get_int(s, p));
+	int res_mode = (int)obs_data_get_int(s, p);
+	obs_data_set_bool(cs, "enable_custom_resolution", res_mode != -1);
+	obs_data_set_int(cs, "resolution_mode", res_mode);
 	build_prop_name(p, sizeof(p), i, "custom_width");
 	obs_data_set_int(cs, "custom_width", obs_data_get_int(s, p));
 	build_prop_name(p, sizeof(p), i, "custom_height");
 	obs_data_set_int(cs, "custom_height", obs_data_get_int(s, p));
 
+	// Read crop settings into gaze_output fields
 	build_prop_name(p, sizeof(p), i, "enable_crop");
-	obs_data_set_bool(cs, "enable_crop", obs_data_get_bool(s, p));
-	build_prop_name(p, sizeof(p), i, "crop_left");
-	obs_data_set_int(cs, "crop_left", obs_data_get_int(s, p));
-	build_prop_name(p, sizeof(p), i, "crop_top");
-	obs_data_set_int(cs, "crop_top", obs_data_get_int(s, p));
-	build_prop_name(p, sizeof(p), i, "crop_width");
-	obs_data_set_int(cs, "crop_width", obs_data_get_int(s, p));
-	build_prop_name(p, sizeof(p), i, "crop_height");
-	obs_data_set_int(cs, "crop_height", obs_data_get_int(s, p));
+	bool enable_crop = obs_data_get_bool(s, p);
+	obs_data_set_bool(cs, "enable_crop", enable_crop);
 
-	build_prop_name(p, sizeof(p), i, "enable_custom_framerate");
-	obs_data_set_bool(cs, "enable_custom_framerate",
-			  obs_data_get_bool(s, p));
+	build_prop_name(p, sizeof(p), i, "crop_type");
+	out->crop_type = (enum gaze_crop_type)obs_data_get_int(s, p);
+	build_prop_name(p, sizeof(p), i, "crop_reference");
+	out->crop_reference = (enum gaze_crop_reference)obs_data_get_int(s, p);
+
+	// Read pixel crop settings
+	build_prop_name(p, sizeof(p), i, "crop_ref_x");
+	out->crop_ref_x = (int32_t)obs_data_get_int(s, p);
+	build_prop_name(p, sizeof(p), i, "crop_ref_y");
+	out->crop_ref_y = (int32_t)obs_data_get_int(s, p);
+	build_prop_name(p, sizeof(p), i, "crop_w");
+	out->crop_w = (uint32_t)obs_data_get_int(s, p);
+	build_prop_name(p, sizeof(p), i, "crop_h");
+	out->crop_h = (uint32_t)obs_data_get_int(s, p);
+
+	// Read percentage crop settings
+	build_prop_name(p, sizeof(p), i, "crop_ref_x_pct");
+	out->crop_ref_x_pct = obs_data_get_double(s, p);
+	build_prop_name(p, sizeof(p), i, "crop_ref_y_pct");
+	out->crop_ref_y_pct = obs_data_get_double(s, p);
+	build_prop_name(p, sizeof(p), i, "crop_w_pct");
+	out->crop_w_pct = obs_data_get_double(s, p);
+	build_prop_name(p, sizeof(p), i, "crop_h_pct");
+	out->crop_h_pct = obs_data_get_double(s, p);
+
+	// Crop values are calculated dynamically in process_single_output
+	// based on reference point. We just pass placeholder values here.
+	obs_data_set_int(cs, "crop_left", 0);
+	obs_data_set_int(cs, "crop_top", 0);
+	obs_data_set_int(cs, "crop_width", 0);
+	obs_data_set_int(cs, "crop_height", 0);
+
+	// Frame rate: -1 = Auto (disabled), otherwise use the mode
 	build_prop_name(p, sizeof(p), i, "framerate_mode");
-	obs_data_set_int(cs, "framerate_mode", obs_data_get_int(s, p));
+	int fps_mode = (int)obs_data_get_int(s, p);
+	obs_data_set_bool(cs, "enable_custom_framerate", fps_mode != -1);
+	obs_data_set_int(cs, "framerate_mode", fps_mode);
 	build_prop_name(p, sizeof(p), i, "custom_fps");
 	obs_data_set_int(cs, "custom_fps_num", obs_data_get_int(s, p));
 	obs_data_set_int(cs, "custom_fps_den", 1);
@@ -848,14 +1234,7 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 	// This prevents duplicate sockets/mDNS when OBS creates two filter instances in studio mode
 	out->pending_init = false;
 	if (out->enabled) {
-		if (!out->multicast && out->target_host[0] == '\0') {
-			obs_log(LOG_WARNING,
-				"[gaze-filter] Output %d: No target host for unicast",
-				i + 1);
-			out->enabled = false;
-		} else {
-			out->pending_init = true;
-		}
+		out->pending_init = true;
 	}
 }
 
@@ -869,9 +1248,67 @@ static void gaze_filter_update(void *data, obs_data_t *s)
 	f->codec = (gaze_codec_t)obs_data_get_int(s, "gaze_codec");
 	f->encoder_type =
 		(gaze_encoder_type_t)obs_data_get_int(s, "gaze_encoder_type");
-	f->bitrate_kbps = (uint32_t)obs_data_get_int(s, "gaze_bitrate");
-	f->fec_percent = (uint8_t)obs_data_get_int(s, "gaze_fec_percent");
+
+	// Apply quality preset (or custom values)
+	int preset = (int)obs_data_get_int(s, "gaze_quality_preset");
+	switch (preset) {
+	case 0: // Ultra
+		f->bitrate_kbps = GAZE_PRESET_ULTRA_BITRATE;
+		f->fec_percent = GAZE_PRESET_ULTRA_FEC;
+		break;
+	case 1: // High
+		f->bitrate_kbps = GAZE_PRESET_HIGH_BITRATE;
+		f->fec_percent = GAZE_PRESET_HIGH_FEC;
+		break;
+	case 2: // Balanced
+		f->bitrate_kbps = GAZE_PRESET_BALANCED_BITRATE;
+		f->fec_percent = GAZE_PRESET_BALANCED_FEC;
+		break;
+	case 3: // Low
+		f->bitrate_kbps = GAZE_PRESET_LOW_BITRATE;
+		f->fec_percent = GAZE_PRESET_LOW_FEC;
+		break;
+	case 4: // Custom
+	default:
+		f->bitrate_kbps = (uint32_t)obs_data_get_int(s, "gaze_bitrate");
+		f->fec_percent =
+			(uint8_t)obs_data_get_int(s, "gaze_fec_percent");
+		break;
+	}
+
 	f->stop_when_inactive = obs_data_get_bool(s, "stop_when_inactive");
+
+	// Network interface selection
+	const char *net_ip = obs_data_get_string(s, "gaze_network_interface");
+	strncpy(f->network_interface_ip, net_ip ? net_ip : "",
+		sizeof(f->network_interface_ip) - 1);
+
+	// Resolve to bind_addr and if_index
+	f->network_bind_addr = 0;  // Default: any interface
+	f->network_if_index = 0;   // Default: all interfaces for mDNS
+
+	if (net_ip && net_ip[0] != '\0') {
+		// User selected a specific interface - bind and announce only on that interface
+		gaze_network_list_t net_list;
+		if (gaze_network_get_interfaces(&net_list)) {
+			const gaze_network_interface_t *iface =
+				gaze_network_find_by_ip(&net_list, net_ip);
+			if (iface) {
+				f->network_bind_addr = iface->ip_addr;
+				f->network_if_index = iface->index;
+				obs_log(LOG_INFO,
+					"[gaze-filter] Using network interface: %s (%s), index=%u",
+					iface->name, iface->ip, iface->index);
+			}
+		}
+	} else {
+		// Auto: bind to any (0), announce mDNS on all interfaces (0)
+		// This matches the original behavior before network selection was added
+		f->network_bind_addr = 0;
+		f->network_if_index = 0;
+		obs_log(LOG_INFO,
+			"[gaze-filter] Using all network interfaces (Auto)");
+	}
 
 	for (int i = 0; i < MAX_GAZE_OUTPUTS; i++)
 		update_output(&f->outputs[i], s, i, f);
@@ -888,6 +1325,15 @@ static void *gaze_filter_create(obs_data_t *s, obs_source_t *src)
 	auto f = (gaze_filter_t *)bzalloc(sizeof(gaze_filter_t));
 	f->obs_source = src;
 	obs_get_video_info(&f->ovi);
+
+	// Calculate timestamp offset: wall_clock - obs_time
+	// This allows converting OBS frame timestamps to wall clock for latency measurement
+	auto wall_now = std::chrono::system_clock::now();
+	int64_t wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				  wall_now.time_since_epoch())
+				  .count();
+	int64_t obs_ms = (int64_t)(os_gettime_ns() / 1000000);
+	f->timestamp_offset_ms = wall_ms - obs_ms;
 
 	for (int i = 0; i < MAX_GAZE_OUTPUTS; i++) {
 		gaze_output_t *out = &f->outputs[i];

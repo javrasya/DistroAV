@@ -54,6 +54,7 @@ typedef struct gaze_discovery {
 	uint32_t width;
 	uint32_t height;
 	uint32_t fps;
+	uint32_t if_index;  // Network interface index (0 = all)
 
 	bool registered;
 	bool initialized;
@@ -77,11 +78,13 @@ bool gaze_discovery_init(gaze_discovery_t *disc);
  * @param width Video width
  * @param height Video height
  * @param fps Frame rate
+ * @param if_index Network interface index (0 = all interfaces)
  * @return true on success, false on failure
  */
 bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 			     uint16_t port, gaze_codec_t codec,
-			     uint32_t width, uint32_t height, uint32_t fps);
+			     uint32_t width, uint32_t height, uint32_t fps,
+			     uint32_t if_index);
 
 /**
  * Update service info.

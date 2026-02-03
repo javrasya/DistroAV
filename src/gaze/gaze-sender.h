@@ -43,12 +43,12 @@ extern "C" {
 /**
  * Gaze Stream Sender
  *
- * Handles UDP/RTP transmission and RTCP receiver detection.
+ * Handles UDP/RTP transmission with receiver-initiated subscription.
  *
  * Features:
- * - Rate-controlled UDP sending
- * - RTCP listener for receiver detection
- * - Multicast/unicast support
+ * - Receiver-initiated subscription (receivers send subscribe/heartbeat)
+ * - Multi-receiver unicast (up to GAZE_MAX_RECEIVERS)
+ * - Automatic receiver timeout and cleanup
  * - Large socket buffers
  */
 
@@ -59,8 +59,17 @@ typedef struct gaze_sender_stats {
 	uint64_t packets_sent;
 	uint64_t bytes_sent;
 	uint64_t send_errors;
-	uint64_t rtcp_received;
+	uint64_t control_received;
 } gaze_sender_stats_t;
+
+/**
+ * Single receiver entry
+ */
+typedef struct gaze_receiver {
+	struct sockaddr_in addr;
+	uint64_t last_seen_ns;
+	bool active;
+} gaze_receiver_t;
 
 /**
  * Sender state
@@ -68,18 +77,20 @@ typedef struct gaze_sender_stats {
 typedef struct gaze_sender {
 	// Sockets
 	gaze_socket_t rtp_socket;
-	gaze_socket_t rtcp_socket;
+	gaze_socket_t rtcp_socket;  // Also used for control messages
 
-	// Target endpoint
-	struct sockaddr_in target_addr;
+	// Network binding
 	uint16_t rtp_port;
-	bool multicast;
+	uint32_t bind_addr;  // IPv4 address in network byte order (0 = any)
 
-	// RTCP receiver detection
-	pthread_t rtcp_thread;
-	volatile bool rtcp_running;
-	volatile uint64_t last_rtcp_received_ns;
-	pthread_mutex_t rtcp_mutex;
+	// Receiver list (subscription-based)
+	gaze_receiver_t receivers[GAZE_MAX_RECEIVERS];
+	int receiver_count;
+	pthread_mutex_t receiver_mutex;
+
+	// Control message listener thread
+	pthread_t control_thread;
+	volatile bool control_running;
 
 	// Statistics
 	gaze_sender_stats_t stats;
@@ -90,14 +101,16 @@ typedef struct gaze_sender {
 /**
  * Initialize the sender.
  *
+ * Uses receiver-initiated subscription: receivers discover via mDNS
+ * and send subscribe messages to the sender's control port (rtp_port + 1).
+ *
  * @param sender The sender instance
- * @param target_host Target IP address (ignored for multicast)
- * @param rtp_port RTP port (RTCP uses port + 1)
- * @param multicast Whether to use multicast
+ * @param rtp_port RTP port (control uses port + 1)
+ * @param bind_addr IPv4 address to bind to (0 = INADDR_ANY)
  * @return true on success, false on failure
  */
-bool gaze_sender_init(gaze_sender_t *sender, const char *target_host,
-		      uint16_t rtp_port, bool multicast);
+bool gaze_sender_init(gaze_sender_t *sender, uint16_t rtp_port,
+		      uint32_t bind_addr);
 
 /**
  * Send packets.
@@ -113,22 +126,22 @@ bool gaze_sender_send_packets(gaze_sender_t *sender, gaze_packet_t *packets,
 /**
  * Check if there are active receivers.
  *
- * Returns true if RTCP has been received within the timeout period.
+ * Returns true if there are subscribed receivers that have sent
+ * heartbeats within the timeout period.
  * This can be used to skip encoding when no receivers are connected.
  *
  * @param sender The sender instance
- * @return true if receivers are detected
+ * @return true if receivers are subscribed
  */
 bool gaze_sender_has_receivers(gaze_sender_t *sender);
 
 /**
- * Force receiver detection to true.
- *
- * Useful for unicast where RTCP may not be available.
+ * Get the current receiver count.
  *
  * @param sender The sender instance
+ * @return Number of active receivers
  */
-void gaze_sender_assume_receiver(gaze_sender_t *sender);
+int gaze_sender_get_receiver_count(gaze_sender_t *sender);
 
 /**
  * Get sender statistics.
@@ -144,15 +157,6 @@ void gaze_sender_get_stats(gaze_sender_t *sender, gaze_sender_stats_t *stats);
  * @param sender The sender instance
  */
 void gaze_sender_reset_stats(gaze_sender_t *sender);
-
-/**
- * Update target host (for unicast).
- *
- * @param sender The sender instance
- * @param target_host New target IP address
- * @return true on success, false on failure
- */
-bool gaze_sender_set_target(gaze_sender_t *sender, const char *target_host);
 
 /**
  * Destroy the sender.

@@ -13,11 +13,19 @@ from typing import Optional
 # Protocol constants
 GAZE_PROTOCOL_VERSION = 1
 GAZE_DEFAULT_RTP_PORT = 47998
+GAZE_BASE_PORT = 5960  # Fixed port: GAZE_BASE_PORT + (output_index * 2)
 GAZE_MTU = 1500
 GAZE_RTP_VERSION = 2
 GAZE_RTP_PAYLOAD_TYPE_HEVC = 96
 GAZE_RTP_PAYLOAD_TYPE_H264 = 97
 GAZE_RTP_CLOCK_RATE = 90000
+
+# Control message constants (receiver -> sender subscription protocol)
+GAZE_CTRL_MAGIC = b'GZ'
+GAZE_CTRL_SUBSCRIBE = 0x01
+GAZE_CTRL_HEARTBEAT = 0x02
+GAZE_CTRL_UNSUBSCRIBE = 0x03
+GAZE_HEARTBEAT_INTERVAL_S = 1.0  # Send heartbeat every 1 second
 
 # Header sizes
 RTP_HEADER_SIZE = 12
