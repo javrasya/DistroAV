@@ -102,6 +102,8 @@ typedef struct gaze_output {
 	bool components_initialized;
 	bool pending_init;  // Lazy init: defer until first non-rapid render
 	bool keyframe_requested;
+	bool probe_keyframe_cached;  // True after first keyframe cached for probe
+	uint64_t last_probe_refresh_ns;  // Last time we refreshed probe keyframe
 	uint64_t last_render_frame;  // Dedup renders in studio mode (OBS frame counter)
 
 	// Back-reference

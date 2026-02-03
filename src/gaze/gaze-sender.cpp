@@ -20,6 +20,7 @@
 #include <plugin-support.h>
 #include <util/platform.h>
 #include <cstring>
+#include <cstdlib>
 
 #ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
@@ -171,6 +172,92 @@ static void prune_inactive_receivers(gaze_sender_t *sender)
 	}
 }
 
+// Handle PROBE message and send response
+static void handle_probe_message(gaze_sender_t *sender, const uint8_t *data,
+				 int len, struct sockaddr_in *from_addr)
+{
+	if (len < GAZE_PROBE_REQUEST_SIZE)
+		return;
+
+	uint8_t flags = data[3];
+	uint32_t request_id = gaze_ntohl(*(uint32_t *)(data + 4));
+	bool request_frame = (flags & GAZE_PROBE_FLAG_REQUEST_FRAME) != 0;
+
+	// Build response
+	// Max response size: header + potential keyframe
+	pthread_mutex_lock(&sender->keyframe_mutex);
+
+	size_t frame_size = 0;
+	uint8_t *frame_data = nullptr;
+	uint32_t frame_width = 0;
+	uint32_t frame_height = 0;
+
+	if (request_frame && sender->last_keyframe && sender->last_keyframe_size > 0) {
+		frame_size = sender->last_keyframe_size;
+		frame_data = sender->last_keyframe;
+		frame_width = sender->last_keyframe_width;
+		frame_height = sender->last_keyframe_height;
+	}
+
+	size_t response_size = GAZE_PROBE_RESPONSE_HEADER_SIZE + frame_size;
+	uint8_t *response = (uint8_t *)malloc(response_size);
+	if (!response) {
+		pthread_mutex_unlock(&sender->keyframe_mutex);
+		return;
+	}
+
+	// Build header
+	response[0] = GAZE_CTRL_MAGIC_0;
+	response[1] = GAZE_CTRL_MAGIC_1;
+	response[2] = GAZE_CTRL_PROBE_RESPONSE;
+
+	// Status flags
+	uint8_t status = 0;
+	if (sender->stream_active)
+		status |= GAZE_PROBE_STATUS_ACTIVE;
+	if (sender->receiver_count > 0)
+		status |= GAZE_PROBE_STATUS_HAS_RECEIVERS;
+	if (frame_size > 0)
+		status |= GAZE_PROBE_STATUS_FRAME_INCLUDED;
+	response[3] = status;
+
+	// Request ID (echoed)
+	*(uint32_t *)(response + 4) = gaze_htonl(request_id);
+
+	// Stream info - use cached frame dimensions if available, else stream_info
+	uint16_t width = frame_width > 0 ? (uint16_t)frame_width : sender->stream_info.width;
+	uint16_t height = frame_height > 0 ? (uint16_t)frame_height : sender->stream_info.height;
+	*(uint16_t *)(response + 8) = gaze_htons(width);
+	*(uint16_t *)(response + 10) = gaze_htons(height);
+	*(uint16_t *)(response + 12) = gaze_htons(sender->stream_info.fps_num);
+	*(uint16_t *)(response + 14) = gaze_htons(sender->stream_info.fps_den);
+
+	// Frame count
+	*(uint32_t *)(response + 16) = gaze_htonl(sender->frame_count);
+
+	// Frame data size
+	*(uint32_t *)(response + 20) = gaze_htonl((uint32_t)frame_size);
+
+	// Copy frame data if included
+	if (frame_size > 0 && frame_data) {
+		memcpy(response + GAZE_PROBE_RESPONSE_HEADER_SIZE, frame_data, frame_size);
+	}
+
+	pthread_mutex_unlock(&sender->keyframe_mutex);
+
+	// Send response back to requester
+	sendto(sender->rtcp_socket, (const char *)response, (int)response_size, 0,
+	       (struct sockaddr *)from_addr, sizeof(*from_addr));
+
+	free(response);
+
+	char ip_str[INET_ADDRSTRLEN];
+	inet_ntop(AF_INET, &from_addr->sin_addr, ip_str, sizeof(ip_str));
+	obs_log(LOG_DEBUG,
+		"[gaze-sender] Probe response sent to %s:%d (status=0x%02x, frame=%zu bytes)",
+		ip_str, ntohs(from_addr->sin_port), status, frame_size);
+}
+
 // Handle incoming control message
 static void handle_control_message(gaze_sender_t *sender,
 				   const uint8_t *data, int len,
@@ -185,24 +272,28 @@ static void handle_control_message(gaze_sender_t *sender,
 
 	uint8_t msg_type = data[2];
 
-	pthread_mutex_lock(&sender->receiver_mutex);
-
 	switch (msg_type) {
 	case GAZE_CTRL_SUBSCRIBE:
 	case GAZE_CTRL_HEARTBEAT:
+		pthread_mutex_lock(&sender->receiver_mutex);
 		add_or_update_receiver(sender, from_addr);
 		sender->stats.control_received++;
+		pthread_mutex_unlock(&sender->receiver_mutex);
 		break;
 	case GAZE_CTRL_UNSUBSCRIBE:
+		pthread_mutex_lock(&sender->receiver_mutex);
 		remove_receiver(sender, from_addr);
+		sender->stats.control_received++;
+		pthread_mutex_unlock(&sender->receiver_mutex);
+		break;
+	case GAZE_CTRL_PROBE:
+		handle_probe_message(sender, data, len, from_addr);
 		sender->stats.control_received++;
 		break;
 	default:
 		// Unknown message type, ignore
 		break;
 	}
-
-	pthread_mutex_unlock(&sender->receiver_mutex);
 }
 
 // Control message listener thread
@@ -313,6 +404,16 @@ bool gaze_sender_init(gaze_sender_t *sender, uint16_t rtp_port,
 	// Initialize receiver mutex
 	pthread_mutex_init(&sender->receiver_mutex, nullptr);
 
+	// Initialize keyframe mutex and cache
+	pthread_mutex_init(&sender->keyframe_mutex, nullptr);
+	sender->last_keyframe = nullptr;
+	sender->last_keyframe_size = 0;
+	sender->last_keyframe_width = 0;
+	sender->last_keyframe_height = 0;
+	sender->frame_count = 0;
+	sender->stream_active = false;
+	memset(&sender->stream_info, 0, sizeof(sender->stream_info));
+
 	// Start control message listener thread
 	sender->control_running = true;
 	if (pthread_create(&sender->control_thread, nullptr, control_thread_func,
@@ -320,6 +421,7 @@ bool gaze_sender_init(gaze_sender_t *sender, uint16_t rtp_port,
 		obs_log(LOG_ERROR,
 			"[gaze-sender] Failed to create control thread");
 		pthread_mutex_destroy(&sender->receiver_mutex);
+		pthread_mutex_destroy(&sender->keyframe_mutex);
 		close_socket(sender->rtp_socket);
 		close_socket(sender->rtcp_socket);
 		sender->rtp_socket = GAZE_INVALID_SOCKET;
@@ -430,6 +532,16 @@ void gaze_sender_destroy(gaze_sender_t *sender)
 
 	pthread_mutex_destroy(&sender->receiver_mutex);
 
+	// Free cached keyframe
+	pthread_mutex_lock(&sender->keyframe_mutex);
+	if (sender->last_keyframe) {
+		free(sender->last_keyframe);
+		sender->last_keyframe = nullptr;
+		sender->last_keyframe_size = 0;
+	}
+	pthread_mutex_unlock(&sender->keyframe_mutex);
+	pthread_mutex_destroy(&sender->keyframe_mutex);
+
 	// Close sockets
 	close_socket(sender->rtcp_socket);
 	close_socket(sender->rtp_socket);
@@ -437,4 +549,59 @@ void gaze_sender_destroy(gaze_sender_t *sender)
 	sender->rtp_socket = GAZE_INVALID_SOCKET;
 	sender->rtcp_socket = GAZE_INVALID_SOCKET;
 	sender->initialized = false;
+}
+
+void gaze_sender_cache_keyframe(gaze_sender_t *sender, const uint8_t *data,
+				size_t size, uint32_t width, uint32_t height)
+{
+	if (!sender || !sender->initialized || !data || size == 0)
+		return;
+
+	pthread_mutex_lock(&sender->keyframe_mutex);
+
+	// Reallocate buffer if needed
+	if (sender->last_keyframe_size < size) {
+		uint8_t *new_buf = (uint8_t *)realloc(sender->last_keyframe, size);
+		if (!new_buf) {
+			pthread_mutex_unlock(&sender->keyframe_mutex);
+			return;
+		}
+		sender->last_keyframe = new_buf;
+	}
+
+	memcpy(sender->last_keyframe, data, size);
+	sender->last_keyframe_size = size;
+	sender->last_keyframe_width = width;
+	sender->last_keyframe_height = height;
+
+	pthread_mutex_unlock(&sender->keyframe_mutex);
+}
+
+void gaze_sender_set_stream_info(gaze_sender_t *sender, uint16_t width,
+				 uint16_t height, uint16_t fps_num,
+				 uint16_t fps_den)
+{
+	if (!sender)
+		return;
+
+	sender->stream_info.width = width;
+	sender->stream_info.height = height;
+	sender->stream_info.fps_num = fps_num;
+	sender->stream_info.fps_den = fps_den;
+}
+
+void gaze_sender_set_active(gaze_sender_t *sender, bool active)
+{
+	if (!sender)
+		return;
+
+	sender->stream_active = active;
+}
+
+void gaze_sender_increment_frame_count(gaze_sender_t *sender)
+{
+	if (!sender)
+		return;
+
+	sender->frame_count++;
 }

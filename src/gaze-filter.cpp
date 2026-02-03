@@ -196,7 +196,18 @@ static void gaze_output_raw_video(void *data, struct video_data *frame)
 	if (is_keyframe) {
 		obs_log(LOG_DEBUG, "[gaze-filter] Keyframe at frame %u",
 			gaze_packetizer_get_frame_index(&out->packetizer));
+
+		// Cache keyframe for probe responses
+		// Use known dimensions since video_data doesn't carry size info
+		gaze_sender_cache_keyframe(&out->sender, encoded_data,
+					   encoded_size, out->known_width,
+					   out->known_height);
+		out->probe_keyframe_cached = true;
+		out->last_probe_refresh_ns = os_gettime_ns();
 	}
+
+	// Increment frame count for probe stats
+	gaze_sender_increment_frame_count(&out->sender);
 
 	// Packetize (using capture_ts_ms from start of processing)
 	gaze_packet_t *packets = nullptr;
@@ -378,6 +389,13 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 				  fps_num, fps_den, GAZE_DEFAULT_KEYFRAME_INTERVAL);
 		// Request keyframe after encoder (re)creation
 		out->keyframe_requested = true;
+		out->probe_keyframe_cached = false;  // Re-cache keyframe for new resolution
+
+		// Update stream info for probe responses
+		gaze_sender_set_stream_info(&out->sender, (uint16_t)render_width,
+					    (uint16_t)render_height,
+					    (uint16_t)fps_num, (uint16_t)fps_den);
+		gaze_sender_set_active(&out->sender, true);
 		pthread_mutex_unlock(&out->output_mutex);
 
 		// Register or update discovery (on selected network interface)
@@ -521,6 +539,18 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 				out->video_linesize, &encoded_data,
 				&encoded_size, &is_keyframe) &&
 	    encoded_size > 0) {
+		// Cache keyframe for probe responses (always update to keep preview fresh)
+		if (is_keyframe) {
+			gaze_sender_cache_keyframe(&out->sender, encoded_data,
+						   encoded_size, render_width,
+						   render_height);
+			out->probe_keyframe_cached = true;
+			out->last_probe_refresh_ns = os_gettime_ns();
+		}
+
+		// Increment frame count for probe stats
+		gaze_sender_increment_frame_count(&out->sender);
+
 		// Packetize and send (using capture_ts_ms from start of processing)
 		gaze_packet_t *packets = nullptr;
 		size_t packet_count = 0;
@@ -605,10 +635,16 @@ static void gaze_filter_render_video(void *data, gs_effect_t *)
 			continue;
 		}
 
-		// Check for receivers
-		if (!gaze_sender_has_receivers(&out->sender)) {
-			receiver_fail++;
-			continue;
+		// Check for receivers - but process periodically to keep probe keyframe fresh
+		bool has_receivers = gaze_sender_has_receivers(&out->sender);
+		if (!has_receivers) {
+			// Refresh probe keyframe every 2 seconds even without receivers
+			bool needs_refresh = !out->probe_keyframe_cached ||
+				(timestamp - out->last_probe_refresh_ns > 2000000000ULL);
+			if (!needs_refresh) {
+				receiver_fail++;
+				continue;
+			}
 		}
 
 		// FPS gating - skip GPU work for frames that will be dropped
@@ -654,12 +690,16 @@ static void output_destroy_components(gaze_output_t *out)
 
 	out->known_width = 0;
 	out->known_height = 0;
+	out->probe_keyframe_cached = false;
+	out->last_probe_refresh_ns = 0;
 
 	pthread_mutex_lock(&out->output_mutex);
 
 	gaze_discovery_unregister(&out->discovery);
 	gaze_discovery_destroy(&out->discovery);
 
+	// Mark stream as inactive before destroying
+	gaze_sender_set_active(&out->sender, false);
 	gaze_sender_destroy(&out->sender);
 	gaze_packetizer_destroy(&out->packetizer);
 	gaze_encoder_destroy(&out->encoder);
@@ -701,17 +741,22 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 	// Encoder will be initialized when we know the dimensions
 	// (in process_single_output)
 
-	// Initialize discovery
+	// Initialize discovery (registration deferred until we know dimensions)
 	gaze_discovery_init(&out->discovery);
 
-	// Register mDNS immediately so receivers can discover us
-	// Use 0x0 dimensions initially - will be updated when we know actual size
-	gaze_discovery_register(&out->discovery, out->stream_name,
-				out->rtp_port, f->codec, 0, 0, 0,
-				f->network_if_index);
+	// Store service info for later registration when dimensions are known
+	strncpy(out->discovery.service_name, out->stream_name,
+		sizeof(out->discovery.service_name) - 1);
+	out->discovery.port = out->rtp_port;
+	out->discovery.codec = f->codec;
+	out->discovery.if_index = f->network_if_index;
+
+	// Set sender as active (stream is producing frames)
+	gaze_sender_set_active(&out->sender, true);
 
 	// Request a keyframe at startup so new receivers can decode immediately
 	out->keyframe_requested = true;
+	out->probe_keyframe_cached = false;  // Need to cache keyframe for probing
 
 	out->components_initialized = true;
 
@@ -1282,6 +1327,8 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 
 	out->known_width = 0;
 	out->known_height = 0;
+	out->probe_keyframe_cached = false;
+	out->last_probe_refresh_ns = 0;
 
 	// Destroy existing components
 	output_destroy_components(out);

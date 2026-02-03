@@ -24,6 +24,7 @@ class GazeDecoder:
         self._current_codec: Optional[GazeCodec] = None
         self.frames_decoded = 0
         self.decode_errors = 0
+        self.last_error: Optional[str] = None
 
     def _init_decoder(self, codec: GazeCodec) -> None:
         """Initialize decoder for the specified codec"""
@@ -39,6 +40,8 @@ class GazeDecoder:
         av_codec = av.codec.Codec(codec_name, "r")
         self._codec_ctx = av.CodecContext.create(av_codec)
         self._codec_ctx.thread_type = "AUTO"
+        # Open the codec context explicitly
+        self._codec_ctx.open()
         self._current_codec = codec
 
     def decode(self, frame: ReceivedFrame) -> Optional[np.ndarray]:
@@ -70,8 +73,9 @@ class GazeDecoder:
             # No frame decoded yet (B-frames or buffering)
             return None
 
-        except Exception:
+        except Exception as e:
             self.decode_errors += 1
+            self.last_error = str(e)
             return None
 
     def flush(self) -> list:

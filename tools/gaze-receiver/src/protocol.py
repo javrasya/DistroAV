@@ -25,7 +25,21 @@ GAZE_CTRL_MAGIC = b'GZ'
 GAZE_CTRL_SUBSCRIBE = 0x01
 GAZE_CTRL_HEARTBEAT = 0x02
 GAZE_CTRL_UNSUBSCRIBE = 0x03
+GAZE_CTRL_PROBE = 0x04          # Request stream status
+GAZE_CTRL_PROBE_RESPONSE = 0x05  # Response with status + optional frame
 GAZE_HEARTBEAT_INTERVAL_S = 1.0  # Send heartbeat every 1 second
+
+# Probe request flags
+GAZE_PROBE_FLAG_REQUEST_FRAME = 0x01  # Include keyframe in response
+
+# Probe response status flags
+GAZE_PROBE_STATUS_ACTIVE = 0x01          # Stream is active (filter enabled)
+GAZE_PROBE_STATUS_HAS_RECEIVERS = 0x02   # Has active subscribers
+GAZE_PROBE_STATUS_FRAME_INCLUDED = 0x04  # Frame data in response
+
+# Probe protocol sizes
+GAZE_PROBE_REQUEST_SIZE = 8   # Magic(2) + Type(1) + Flags(1) + RequestID(4)
+GAZE_PROBE_RESPONSE_HEADER_SIZE = 24  # Header without frame data
 
 # Header sizes
 RTP_HEADER_SIZE = 12
@@ -183,4 +197,71 @@ class GazePacket:
 
             return cls(rtp=rtp, meta=meta, frame=frame, payload=payload)
         except (ValueError, struct.error):
+            return None
+
+
+@dataclass
+class GazeProbeResponse:
+    """Parsed probe response from sender"""
+    stream_active: bool
+    has_receivers: bool
+    frame_included: bool
+    request_id: int
+    width: int
+    height: int
+    fps_num: int
+    fps_den: int
+    frame_count: int
+    frame_data: Optional[bytes]
+
+    @property
+    def fps(self) -> float:
+        """Calculate FPS as float"""
+        if self.fps_den == 0:
+            return 0.0
+        return self.fps_num / self.fps_den
+
+    @classmethod
+    def parse(cls, data: bytes) -> Optional["GazeProbeResponse"]:
+        """Parse a probe response message"""
+        if len(data) < GAZE_PROBE_RESPONSE_HEADER_SIZE:
+            return None
+
+        # Check magic and type
+        if data[0:2] != GAZE_CTRL_MAGIC:
+            return None
+        if data[2] != GAZE_CTRL_PROBE_RESPONSE:
+            return None
+
+        try:
+            status = data[3]
+            stream_active = bool(status & GAZE_PROBE_STATUS_ACTIVE)
+            has_receivers = bool(status & GAZE_PROBE_STATUS_HAS_RECEIVERS)
+            frame_included = bool(status & GAZE_PROBE_STATUS_FRAME_INCLUDED)
+
+            request_id = struct.unpack(">I", data[4:8])[0]
+            width = struct.unpack(">H", data[8:10])[0]
+            height = struct.unpack(">H", data[10:12])[0]
+            fps_num = struct.unpack(">H", data[12:14])[0]
+            fps_den = struct.unpack(">H", data[14:16])[0]
+            frame_count = struct.unpack(">I", data[16:20])[0]
+            frame_data_size = struct.unpack(">I", data[20:24])[0]
+
+            frame_data = None
+            if frame_included and frame_data_size > 0:
+                frame_data = data[GAZE_PROBE_RESPONSE_HEADER_SIZE:GAZE_PROBE_RESPONSE_HEADER_SIZE + frame_data_size]
+
+            return cls(
+                stream_active=stream_active,
+                has_receivers=has_receivers,
+                frame_included=frame_included,
+                request_id=request_id,
+                width=width,
+                height=height,
+                fps_num=fps_num,
+                fps_den=fps_den,
+                frame_count=frame_count,
+                frame_data=frame_data,
+            )
+        except (struct.error, IndexError):
             return None

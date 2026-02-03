@@ -16,11 +16,15 @@ from .protocol import (
     GazePacket,
     GazeCodec,
     GazeFrameType,
+    GazeProbeResponse,
     GAZE_MTU,
     GAZE_CTRL_MAGIC,
     GAZE_CTRL_SUBSCRIBE,
     GAZE_CTRL_HEARTBEAT,
     GAZE_CTRL_UNSUBSCRIBE,
+    GAZE_CTRL_PROBE,
+    GAZE_PROBE_FLAG_REQUEST_FRAME,
+    GAZE_PROBE_REQUEST_SIZE,
     GAZE_HEARTBEAT_INTERVAL_S,
 )
 
@@ -360,3 +364,69 @@ class GazeReceiver:
             return self.frame_queue.get(timeout=timeout)
         except Empty:
             return None
+
+
+def probe_stream(
+    host: str,
+    port: int,
+    request_frame: bool = True,
+    timeout: float = 1.0,
+) -> Optional[GazeProbeResponse]:
+    """
+    Probe a Gaze stream to check its status and optionally get a preview frame.
+
+    This sends a PROBE message to the sender and waits for a response.
+    Does not subscribe to the stream or receive continuous video.
+
+    Args:
+        host: IP address of the sender
+        port: RTP port of the stream
+        request_frame: If True, request a keyframe in the response
+        timeout: Timeout in seconds for response
+
+    Returns:
+        GazeProbeResponse if successful, None if no response or error
+    """
+    import random
+    import struct
+
+    control_port = port + 1  # Control messages go to RTP port + 1
+
+    # Create UDP socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+
+    try:
+        # Bind to any port to receive response
+        sock.bind(("0.0.0.0", 0))
+
+        # Build probe request
+        flags = GAZE_PROBE_FLAG_REQUEST_FRAME if request_frame else 0
+        request_id = random.randint(0, 0xFFFFFFFF)
+
+        # Format: Magic (2) + Type (1) + Flags (1) + RequestID (4)
+        request = GAZE_CTRL_MAGIC + bytes([GAZE_CTRL_PROBE, flags]) + struct.pack(">I", request_id)
+
+        # Send probe
+        sock.sendto(request, (host, control_port))
+
+        # Wait for response
+        # Response could be large if it includes a keyframe
+        max_response_size = 2 * 1024 * 1024  # 2MB max keyframe
+        data, addr = sock.recvfrom(max_response_size)
+
+        # Parse response
+        response = GazeProbeResponse.parse(data)
+
+        # Verify request ID matches
+        if response and response.request_id != request_id:
+            return None
+
+        return response
+
+    except socket.timeout:
+        return None
+    except Exception:
+        return None
+    finally:
+        sock.close()

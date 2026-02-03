@@ -72,6 +72,16 @@ typedef struct gaze_receiver {
 } gaze_receiver_t;
 
 /**
+ * Stream info for probe responses
+ */
+typedef struct gaze_stream_info {
+	uint16_t width;
+	uint16_t height;
+	uint16_t fps_num;
+	uint16_t fps_den;
+} gaze_stream_info_t;
+
+/**
  * Sender state
  */
 typedef struct gaze_sender {
@@ -91,6 +101,18 @@ typedef struct gaze_sender {
 	// Control message listener thread
 	pthread_t control_thread;
 	volatile bool control_running;
+
+	// Probe response: cached keyframe
+	uint8_t *last_keyframe;
+	size_t last_keyframe_size;
+	uint32_t last_keyframe_width;
+	uint32_t last_keyframe_height;
+	pthread_mutex_t keyframe_mutex;
+
+	// Stream info for probe responses
+	gaze_stream_info_t stream_info;
+	uint32_t frame_count;
+	bool stream_active;
 
 	// Statistics
 	gaze_sender_stats_t stats;
@@ -176,6 +198,49 @@ bool gaze_sender_init_platform(void);
  * Cleanup Winsock (Windows only, call at shutdown).
  */
 void gaze_sender_cleanup_platform(void);
+
+/**
+ * Cache the latest keyframe for probe responses.
+ *
+ * Called after encoding a keyframe to store it for clients
+ * that request a preview frame via GAZE_CTRL_PROBE.
+ *
+ * @param sender The sender instance
+ * @param data Encoded keyframe data
+ * @param size Size of encoded data in bytes
+ * @param width Frame width in pixels
+ * @param height Frame height in pixels
+ */
+void gaze_sender_cache_keyframe(gaze_sender_t *sender, const uint8_t *data,
+				size_t size, uint32_t width, uint32_t height);
+
+/**
+ * Set stream info for probe responses.
+ *
+ * @param sender The sender instance
+ * @param width Stream width
+ * @param height Stream height
+ * @param fps_num FPS numerator
+ * @param fps_den FPS denominator
+ */
+void gaze_sender_set_stream_info(gaze_sender_t *sender, uint16_t width,
+				 uint16_t height, uint16_t fps_num,
+				 uint16_t fps_den);
+
+/**
+ * Set whether the stream is actively producing frames.
+ *
+ * @param sender The sender instance
+ * @param active true if stream is active
+ */
+void gaze_sender_set_active(gaze_sender_t *sender, bool active);
+
+/**
+ * Increment the frame count (for probe response statistics).
+ *
+ * @param sender The sender instance
+ */
+void gaze_sender_increment_frame_count(gaze_sender_t *sender);
 
 #ifdef __cplusplus
 }

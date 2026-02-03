@@ -211,9 +211,19 @@ typedef struct gaze_rtcp_header {
 #define GAZE_CTRL_MAGIC_1    'Z'
 
 // Control message types (sent by receiver to sender on RTCP port)
-#define GAZE_CTRL_SUBSCRIBE   0x01  // Receiver wants to receive stream
-#define GAZE_CTRL_HEARTBEAT   0x02  // Receiver still alive (sent periodically)
-#define GAZE_CTRL_UNSUBSCRIBE 0x03  // Receiver stopping
+#define GAZE_CTRL_SUBSCRIBE      0x01  // Receiver wants to receive stream
+#define GAZE_CTRL_HEARTBEAT      0x02  // Receiver still alive (sent periodically)
+#define GAZE_CTRL_UNSUBSCRIBE    0x03  // Receiver stopping
+#define GAZE_CTRL_PROBE          0x04  // Request stream status
+#define GAZE_CTRL_PROBE_RESPONSE 0x05  // Response with status + optional frame
+
+// Probe request flags (byte 3 of PROBE message)
+#define GAZE_PROBE_FLAG_REQUEST_FRAME  0x01  // Include keyframe in response
+
+// Probe response status flags (byte 3 of PROBE_RESPONSE message)
+#define GAZE_PROBE_STATUS_ACTIVE         0x01  // Stream is active (filter enabled)
+#define GAZE_PROBE_STATUS_HAS_RECEIVERS  0x02  // Has active subscribers
+#define GAZE_PROBE_STATUS_FRAME_INCLUDED 0x04  // Frame data in response
 
 // Timing constants
 #define GAZE_HEARTBEAT_INTERVAL_MS 1000                   // Receiver sends every 1s
@@ -221,6 +231,10 @@ typedef struct gaze_rtcp_header {
 
 // Receiver list limits
 #define GAZE_MAX_RECEIVERS 8
+
+// Probe protocol sizes
+#define GAZE_PROBE_REQUEST_SIZE  8   // Magic(2) + Type(1) + Flags(1) + RequestID(4)
+#define GAZE_PROBE_RESPONSE_HEADER_SIZE 24  // Header without frame data
 
 // Fixed port assignment: port = GAZE_BASE_PORT + (output_index * 2)
 // Output 1: 5960 (RTP), 5961 (RTCP/control)
