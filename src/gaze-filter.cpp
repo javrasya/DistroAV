@@ -279,6 +279,7 @@ static void output_recreate_video_output(gaze_output_t *out, uint32_t width,
 
 //
 // Process a single output
+// Pipeline: Source → Pre-Crop Resolution → Crop → Post-Crop Resolution → Encode
 //
 static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 				  obs_source_t *target, obs_source_t *parent,
@@ -291,16 +292,27 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 	int64_t obs_ts_ms = (int64_t)(timestamp / 1000000);
 	uint32_t capture_ts_ms = (uint32_t)(obs_ts_ms + f->timestamp_offset_ms);
 
-	// Determine render dimensions
-	uint32_t render_width = width;
-	uint32_t render_height = height;
+	// Step 1: Determine pre-crop dimensions
+	// If pre-crop resolution is enabled, we first scale the source to that size
+	uint32_t precrop_width = width;
+	uint32_t precrop_height = height;
+	bool use_precrop = out->converter.enable_precrop_resolution &&
+			   out->converter.precrop_target_width > 0 &&
+			   out->converter.precrop_target_height > 0;
 
-	// Calculate crop coordinates from reference point if crop is enabled
+	if (use_precrop) {
+		precrop_width = out->converter.precrop_target_width;
+		precrop_height = out->converter.precrop_target_height;
+	}
+
+	// Step 2: Calculate crop coordinates from reference point if crop is enabled
+	// Crop is now applied to the pre-crop dimensions, not the original source
 	if (out->converter.enable_crop) {
 		// Calculate top-left coordinates from reference point settings
+		// using pre-crop dimensions as the source
 		int32_t crop_left, crop_top;
 		uint32_t crop_w, crop_h;
-		calculate_crop_topleft(out, width, height,
+		calculate_crop_topleft(out, precrop_width, precrop_height,
 				       &crop_left, &crop_top, &crop_w, &crop_h);
 
 		// Update converter's crop settings with calculated values
@@ -317,17 +329,21 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 		out->converter.crop_cache_valid = true;
 	}
 
+	// Step 3: Determine final render dimensions
+	uint32_t render_width = precrop_width;
+	uint32_t render_height = precrop_height;
+
 	if (out->converter.enable_custom_resolution &&
 	    out->converter.target_width > 0 &&
 	    out->converter.target_height > 0) {
-		// Custom resolution: render at target size, crop applied via ortho
+		// Post-crop resolution: render at target size
 		render_width = out->converter.target_width;
 		render_height = out->converter.target_height;
 	} else if (out->converter.enable_crop &&
 		   out->converter.crop_cache_valid &&
 		   out->converter.cached_crop_width > 0 &&
 		   out->converter.cached_crop_height > 0) {
-		// Crop without custom resolution: render at crop size
+		// Crop without post-crop resolution: render at crop size
 		render_width = out->converter.cached_crop_width;
 		render_height = out->converter.cached_crop_height;
 	}
@@ -378,9 +394,7 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 
 		out->known_width = render_width;
 		out->known_height = render_height;
-		// Note: crop cache was already updated by calculate_crop_topleft above
 	}
-	// Note: crop cache was already updated by calculate_crop_topleft above
 
 	// Ensure video_output exists
 	if (!out->video_output) {
@@ -388,20 +402,57 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 					     &f->ovi);
 	}
 
+	struct vec4 bg;
+	vec4_zero(&bg);
+
+	// === Pass 1: Pre-crop resize (source → precrop_target size) ===
+	gs_texture_t *intermediate_texture = nullptr;
+
+	if (use_precrop) {
+		gs_texrender_reset(out->texrender_precrop);
+
+		if (!gs_texrender_begin(out->texrender_precrop, precrop_width, precrop_height))
+			return;
+
+		gs_clear(GS_CLEAR_COLOR, &bg, 0.0f, 0);
+
+		// Full source ortho (no crop yet, just scale)
+		gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+
+		// Render original source
+		if (target == parent) {
+			obs_source_skip_video_filter(f->obs_source);
+		} else {
+			obs_source_video_render(target);
+		}
+
+		gs_blend_state_pop();
+		gs_texrender_end(out->texrender_precrop);
+
+		// Use precrop texture as source for pass 2
+		intermediate_texture = gs_texrender_get_texture(out->texrender_precrop);
+	}
+
+	// === Pass 2: Crop + Post-crop resize (from precrop/source → final size) ===
 	gs_texrender_reset(out->texrender);
 
 	if (!gs_texrender_begin(out->texrender, render_width, render_height))
 		return;
 
-	struct vec4 bg;
-	vec4_zero(&bg);
 	gs_clear(GS_CLEAR_COLOR, &bg, 0.0f, 0);
 
 	// Calculate ortho projection (handles crop)
+	// The source for pass 2 is either the precrop texture or the original source
+	uint32_t source_for_crop_w = use_precrop ? precrop_width : width;
+	uint32_t source_for_crop_h = use_precrop ? precrop_height : height;
+
 	float ortho_left = 0.0f;
-	float ortho_right = (float)width;
+	float ortho_right = (float)source_for_crop_w;
 	float ortho_top = 0.0f;
-	float ortho_bottom = (float)height;
+	float ortho_bottom = (float)source_for_crop_h;
 
 	// Apply crop via ortho projection whenever crop is enabled
 	if (out->converter.enable_crop && out->converter.crop_cache_valid) {
@@ -413,17 +464,32 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 				       out->converter.cached_crop_height);
 	}
 
-	gs_ortho(ortho_left, ortho_right, ortho_top, ortho_bottom, -100.0f,
-		 100.0f);
+	gs_ortho(ortho_left, ortho_right, ortho_top, ortho_bottom, -100.0f, 100.0f);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
-	// Render source
-	if (target == parent) {
-		obs_source_skip_video_filter(f->obs_source);
+	if (intermediate_texture) {
+		// Render from precrop texture
+		gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+		gs_technique_t *tech = gs_effect_get_technique(effect, "Draw");
+		gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
+		gs_effect_set_texture(image, intermediate_texture);
+
+		gs_technique_begin(tech);
+		gs_technique_begin_pass(tech, 0);
+
+		gs_draw_sprite(intermediate_texture, 0, precrop_width, precrop_height);
+
+		gs_technique_end_pass(tech);
+		gs_technique_end(tech);
 	} else {
-		obs_source_video_render(target);
+		// No pre-crop: render from original source directly
+		if (target == parent) {
+			obs_source_skip_video_filter(f->obs_source);
+		} else {
+			obs_source_video_render(target);
+		}
 	}
 
 	gs_blend_state_pop();
@@ -660,32 +726,10 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 }
 
 //
-// Add output properties to UI
+// Helper to add resolution mode dropdown options
 //
-static void add_output_properties(obs_properties_t *props, int index)
+static void add_resolution_mode_options(obs_property_t *res_mode)
 {
-	char prop_name[128];
-	char label[64];
-
-	obs_properties_t *group = obs_properties_create();
-
-	build_prop_name(prop_name, sizeof(prop_name), index, "enabled");
-	snprintf(label, sizeof(label), "Enable Output %d", index + 1);
-	obs_properties_add_bool(group, prop_name, label);
-
-	build_prop_name(prop_name, sizeof(prop_name), index, "stream_name");
-	obs_properties_add_text(group, prop_name,
-				obs_module_text("GazePlugin.StreamName"),
-				OBS_TEXT_DEFAULT);
-
-	// Resolution group
-	char grp[64];
-	obs_properties_t *group_res = obs_properties_create();
-	char res_mode_name[128];
-	build_prop_name(res_mode_name, sizeof(res_mode_name), index, "resolution_mode");
-	auto res_mode =
-		obs_properties_add_list(group_res, res_mode_name, "Preset",
-					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(res_mode, "Auto (Source)", -1);
 	obs_property_list_add_int(res_mode, "240x240", NDI_RESOLUTION_240_SQUARE);
 	obs_property_list_add_int(res_mode, "320x320", NDI_RESOLUTION_320_SQUARE);
@@ -696,30 +740,103 @@ static void add_output_properties(obs_properties_t *props, int index)
 	obs_property_list_add_int(res_mode, "1440p", NDI_RESOLUTION_1440P);
 	obs_property_list_add_int(res_mode, "4K", NDI_RESOLUTION_4K);
 	obs_property_list_add_int(res_mode, "Custom", NDI_RESOLUTION_CUSTOM);
+}
+
+//
+// Add output properties to UI
+// Order: Enable/Name → Frame Rate → Pre-Crop Resolution → Crop → Post-Crop Resolution
+//
+static void add_output_properties(obs_properties_t *props, int index)
+{
+	char prop_name[128];
+	char label[64];
+	char grp[64];
+
+	obs_properties_t *group = obs_properties_create();
+
+	// === Enable/Stream Name (always first) ===
+	build_prop_name(prop_name, sizeof(prop_name), index, "enabled");
+	snprintf(label, sizeof(label), "Enable Output %d", index + 1);
+	obs_properties_add_bool(group, prop_name, label);
+
+	build_prop_name(prop_name, sizeof(prop_name), index, "stream_name");
+	obs_properties_add_text(group, prop_name,
+				obs_module_text("GazePlugin.StreamName"),
+				OBS_TEXT_DEFAULT);
+
+	// === Frame Rate group (first in processing pipeline) ===
+	obs_properties_t *group_fps = obs_properties_create();
+	char fps_mode_name[128];
+	build_prop_name(fps_mode_name, sizeof(fps_mode_name), index, "framerate_mode");
+	auto fps_mode =
+		obs_properties_add_list(group_fps, fps_mode_name, "Preset",
+					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(fps_mode, "Auto (Source)", -1);
+	obs_property_list_add_int(fps_mode, "15 fps", NDI_FRAMERATE_15);
+	obs_property_list_add_int(fps_mode, "30 fps", NDI_FRAMERATE_30);
+	obs_property_list_add_int(fps_mode, "60 fps", NDI_FRAMERATE_60);
+	obs_property_list_add_int(fps_mode, "Custom", NDI_FRAMERATE_CUSTOM);
+
+	// Custom FPS field (only visible when Custom selected)
+	build_prop_name(prop_name, sizeof(prop_name), index, "custom_fps");
+	obs_properties_add_int(group_fps, prop_name, "FPS", 1, 240, 1);
+
+	snprintf(grp, sizeof(grp), "gaze_output_%d_framerate", index + 1);
+	obs_properties_add_group(group, grp, "Frame Rate",
+				 OBS_GROUP_NORMAL, group_fps);
+
+	// Show/hide custom FPS based on dropdown selection
+	obs_property_set_modified_callback2(
+		fps_mode,
+		[](void *priv, obs_properties_t *props, obs_property_t *,
+		   obs_data_t *settings) {
+			int idx = (int)(intptr_t)priv;
+			char mode_prop[128], fps_prop[128];
+			snprintf(mode_prop, sizeof(mode_prop),
+				 "gaze_output_%d_framerate_mode", idx + 1);
+			snprintf(fps_prop, sizeof(fps_prop),
+				 "gaze_output_%d_custom_fps", idx + 1);
+			int mode = (int)obs_data_get_int(settings, mode_prop);
+			bool is_custom = (mode == NDI_FRAMERATE_CUSTOM);
+			obs_property_set_visible(obs_properties_get(props, fps_prop),
+						 is_custom);
+			return true;
+		},
+		(void *)(intptr_t)index);
+
+	// === Pre-Crop Resolution group (scale source before cropping) ===
+	obs_properties_t *group_precrop_res = obs_properties_create();
+	char precrop_res_mode_name[128];
+	build_prop_name(precrop_res_mode_name, sizeof(precrop_res_mode_name), index, "precrop_resolution_mode");
+	auto precrop_res_mode =
+		obs_properties_add_list(group_precrop_res, precrop_res_mode_name, "Preset",
+					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	add_resolution_mode_options(precrop_res_mode);
 
 	// Custom resolution fields (only visible when Custom selected)
-	build_prop_name(prop_name, sizeof(prop_name), index, "custom_width");
-	obs_properties_add_int(group_res, prop_name, "Width", 128, 7680, 1);
-	build_prop_name(prop_name, sizeof(prop_name), index, "custom_height");
-	obs_properties_add_int(group_res, prop_name, "Height", 72, 4320, 1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "precrop_custom_width");
+	obs_properties_add_int(group_precrop_res, prop_name, "Width", 128, 7680, 1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "precrop_custom_height");
+	obs_properties_add_int(group_precrop_res, prop_name, "Height", 72, 4320, 1);
 
-	snprintf(grp, sizeof(grp), "gaze_output_%d_resolution", index + 1);
-	obs_properties_add_group(group, grp, "Resolution",
-				 OBS_GROUP_NORMAL, group_res);
+	snprintf(grp, sizeof(grp), "gaze_output_%d_precrop_resolution", index + 1);
+	obs_properties_add_group(group, grp,
+				 obs_module_text("GazePlugin.PreCropResolution"),
+				 OBS_GROUP_NORMAL, group_precrop_res);
 
-	// Show/hide custom resolution fields based on dropdown selection
+	// Show/hide pre-crop custom resolution fields based on dropdown selection
 	obs_property_set_modified_callback2(
-		res_mode,
+		precrop_res_mode,
 		[](void *priv, obs_properties_t *props, obs_property_t *,
 		   obs_data_t *settings) {
 			int idx = (int)(intptr_t)priv;
 			char mode_prop[128], w_prop[128], h_prop[128];
 			snprintf(mode_prop, sizeof(mode_prop),
-				 "gaze_output_%d_resolution_mode", idx + 1);
+				 "gaze_output_%d_precrop_resolution_mode", idx + 1);
 			snprintf(w_prop, sizeof(w_prop),
-				 "gaze_output_%d_custom_width", idx + 1);
+				 "gaze_output_%d_precrop_custom_width", idx + 1);
 			snprintf(h_prop, sizeof(h_prop),
-				 "gaze_output_%d_custom_height", idx + 1);
+				 "gaze_output_%d_precrop_custom_height", idx + 1);
 			int mode = (int)obs_data_get_int(settings, mode_prop);
 			bool is_custom = (mode == NDI_RESOLUTION_CUSTOM);
 			obs_property_set_visible(obs_properties_get(props, w_prop),
@@ -730,7 +847,7 @@ static void add_output_properties(obs_properties_t *props, int index)
 		},
 		(void *)(intptr_t)index);
 
-	// Crop
+	// === Crop group ===
 	obs_properties_t *group_crop = obs_properties_create();
 	build_prop_name(prop_name, sizeof(prop_name), index, "enable_crop");
 	obs_properties_add_bool(group_crop, prop_name,
@@ -863,41 +980,44 @@ static void add_output_properties(obs_properties_t *props, int index)
 				 obs_module_text("GazePlugin.Crop"),
 				 OBS_GROUP_NORMAL, group_crop);
 
-	// Frame Rate group
-	obs_properties_t *group_fps = obs_properties_create();
-	char fps_mode_name[128];
-	build_prop_name(fps_mode_name, sizeof(fps_mode_name), index, "framerate_mode");
-	auto fps_mode =
-		obs_properties_add_list(group_fps, fps_mode_name, "Preset",
+	// === Post-Crop Resolution group (scale cropped result to final output) ===
+	obs_properties_t *group_res = obs_properties_create();
+	char res_mode_name[128];
+	build_prop_name(res_mode_name, sizeof(res_mode_name), index, "resolution_mode");
+	auto res_mode =
+		obs_properties_add_list(group_res, res_mode_name, "Preset",
 					OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(fps_mode, "Auto (Source)", -1);
-	obs_property_list_add_int(fps_mode, "15 fps", NDI_FRAMERATE_15);
-	obs_property_list_add_int(fps_mode, "30 fps", NDI_FRAMERATE_30);
-	obs_property_list_add_int(fps_mode, "60 fps", NDI_FRAMERATE_60);
-	obs_property_list_add_int(fps_mode, "Custom", NDI_FRAMERATE_CUSTOM);
+	add_resolution_mode_options(res_mode);
 
-	// Custom FPS field (only visible when Custom selected)
-	build_prop_name(prop_name, sizeof(prop_name), index, "custom_fps");
-	obs_properties_add_int(group_fps, prop_name, "FPS", 1, 240, 1);
+	// Custom resolution fields (only visible when Custom selected)
+	build_prop_name(prop_name, sizeof(prop_name), index, "custom_width");
+	obs_properties_add_int(group_res, prop_name, "Width", 128, 7680, 1);
+	build_prop_name(prop_name, sizeof(prop_name), index, "custom_height");
+	obs_properties_add_int(group_res, prop_name, "Height", 72, 4320, 1);
 
-	snprintf(grp, sizeof(grp), "gaze_output_%d_framerate", index + 1);
-	obs_properties_add_group(group, grp, "Frame Rate",
-				 OBS_GROUP_NORMAL, group_fps);
+	snprintf(grp, sizeof(grp), "gaze_output_%d_resolution", index + 1);
+	obs_properties_add_group(group, grp,
+				 obs_module_text("GazePlugin.PostCropResolution"),
+				 OBS_GROUP_NORMAL, group_res);
 
-	// Show/hide custom FPS based on dropdown selection
+	// Show/hide custom resolution fields based on dropdown selection
 	obs_property_set_modified_callback2(
-		fps_mode,
+		res_mode,
 		[](void *priv, obs_properties_t *props, obs_property_t *,
 		   obs_data_t *settings) {
 			int idx = (int)(intptr_t)priv;
-			char mode_prop[128], fps_prop[128];
+			char mode_prop[128], w_prop[128], h_prop[128];
 			snprintf(mode_prop, sizeof(mode_prop),
-				 "gaze_output_%d_framerate_mode", idx + 1);
-			snprintf(fps_prop, sizeof(fps_prop),
-				 "gaze_output_%d_custom_fps", idx + 1);
+				 "gaze_output_%d_resolution_mode", idx + 1);
+			snprintf(w_prop, sizeof(w_prop),
+				 "gaze_output_%d_custom_width", idx + 1);
+			snprintf(h_prop, sizeof(h_prop),
+				 "gaze_output_%d_custom_height", idx + 1);
 			int mode = (int)obs_data_get_int(settings, mode_prop);
-			bool is_custom = (mode == NDI_FRAMERATE_CUSTOM);
-			obs_property_set_visible(obs_properties_get(props, fps_prop),
+			bool is_custom = (mode == NDI_RESOLUTION_CUSTOM);
+			obs_property_set_visible(obs_properties_get(props, w_prop),
+						 is_custom);
+			obs_property_set_visible(obs_properties_get(props, h_prop),
 						 is_custom);
 			return true;
 		},
@@ -1079,6 +1199,15 @@ static void set_output_defaults(obs_data_t *d, int i)
 	snprintf(name, sizeof(name), "Gaze Stream %d", i + 1);
 	obs_data_set_default_string(d, p, name);
 
+	// Pre-crop resolution defaults
+	build_prop_name(p, sizeof(p), i, "precrop_resolution_mode");
+	obs_data_set_default_int(d, p, -1); // Auto (Source)
+	build_prop_name(p, sizeof(p), i, "precrop_custom_width");
+	obs_data_set_default_int(d, p, 1920);
+	build_prop_name(p, sizeof(p), i, "precrop_custom_height");
+	obs_data_set_default_int(d, p, 1080);
+
+	// Post-crop resolution defaults
 	build_prop_name(p, sizeof(p), i, "resolution_mode");
 	obs_data_set_default_int(d, p, -1); // Auto (Source)
 	build_prop_name(p, sizeof(p), i, "custom_width");
@@ -1171,7 +1300,17 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 	// Build converter settings
 	obs_data_t *cs = obs_data_create();
 
-	// Resolution: -1 = Auto (disabled), otherwise use the mode
+	// Pre-crop resolution: -1 = Auto (disabled), otherwise use the mode
+	build_prop_name(p, sizeof(p), i, "precrop_resolution_mode");
+	int precrop_res_mode = (int)obs_data_get_int(s, p);
+	obs_data_set_bool(cs, "enable_precrop_resolution", precrop_res_mode != -1);
+	obs_data_set_int(cs, "precrop_resolution_mode", precrop_res_mode);
+	build_prop_name(p, sizeof(p), i, "precrop_custom_width");
+	obs_data_set_int(cs, "precrop_custom_width", obs_data_get_int(s, p));
+	build_prop_name(p, sizeof(p), i, "precrop_custom_height");
+	obs_data_set_int(cs, "precrop_custom_height", obs_data_get_int(s, p));
+
+	// Post-crop resolution: -1 = Auto (disabled), otherwise use the mode
 	build_prop_name(p, sizeof(p), i, "resolution_mode");
 	int res_mode = (int)obs_data_get_int(s, p);
 	obs_data_set_bool(cs, "enable_custom_resolution", res_mode != -1);
@@ -1339,6 +1478,7 @@ static void *gaze_filter_create(obs_data_t *s, obs_source_t *src)
 		gaze_output_t *out = &f->outputs[i];
 		pthread_mutex_init(&out->output_mutex, nullptr);
 		out->texrender = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
+		out->texrender_precrop = gs_texrender_create(TEXFORMAT, GS_ZS_NONE);
 		ndi_converter_init(&out->converter);
 		out->parent = f;
 		out->output_index = i;
@@ -1363,6 +1503,7 @@ static void gaze_filter_destroy(void *data)
 		gs_stagesurface_unmap(out->stagesurface);
 		gs_stagesurface_destroy(out->stagesurface);
 		gs_texrender_destroy(out->texrender);
+		gs_texrender_destroy(out->texrender_precrop);
 		ndi_converter_destroy(&out->converter);
 		pthread_mutex_destroy(&out->output_mutex);
 	}

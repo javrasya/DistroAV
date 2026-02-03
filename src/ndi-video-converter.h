@@ -72,7 +72,15 @@ enum ndi_crop_type {
  * Video converter state structure
  */
 typedef struct {
-	// Resolution settings
+	// Pre-crop resolution settings (scale before crop)
+	bool enable_precrop_resolution;
+	enum ndi_resolution_mode precrop_resolution_mode;
+	uint32_t precrop_custom_width;
+	uint32_t precrop_custom_height;
+	uint32_t precrop_target_width;   // Computed from mode
+	uint32_t precrop_target_height;
+
+	// Post-crop resolution settings (scale after crop)
 	bool enable_custom_resolution;
 	enum ndi_resolution_mode resolution_mode;
 	uint32_t custom_width;

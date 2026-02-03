@@ -19,6 +19,10 @@
 #include <cstring>
 
 // Property names
+#define PROP_ENABLE_PRECROP_RES "enable_precrop_resolution"
+#define PROP_PRECROP_RESOLUTION_MODE "precrop_resolution_mode"
+#define PROP_PRECROP_CUSTOM_WIDTH "precrop_custom_width"
+#define PROP_PRECROP_CUSTOM_HEIGHT "precrop_custom_height"
 #define PROP_ENABLE_CUSTOM_RES "enable_custom_resolution"
 #define PROP_RESOLUTION_MODE "resolution_mode"
 #define PROP_CUSTOM_WIDTH "custom_width"
@@ -44,6 +48,9 @@ void ndi_converter_init(ndi_video_converter_t *converter)
 	memset(converter, 0, sizeof(ndi_video_converter_t));
 
 	// Set defaults
+	converter->precrop_resolution_mode = NDI_RESOLUTION_AUTO;
+	converter->precrop_custom_width = 1920;
+	converter->precrop_custom_height = 1080;
 	converter->resolution_mode = NDI_RESOLUTION_AUTO;
 	converter->scale_type = NDI_SCALE_BICUBIC;
 	converter->framerate_mode = NDI_FRAMERATE_AUTO;
@@ -246,14 +253,45 @@ void ndi_converter_update_crop_cache(ndi_video_converter_t *converter, uint32_t 
 
 void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings)
 {
-	// Resolution settings
+	// Pre-crop resolution settings
+	converter->enable_precrop_resolution = obs_data_get_bool(settings, PROP_ENABLE_PRECROP_RES);
+	converter->precrop_resolution_mode = (enum ndi_resolution_mode)obs_data_get_int(settings, PROP_PRECROP_RESOLUTION_MODE);
+	converter->precrop_custom_width = (uint32_t)obs_data_get_int(settings, PROP_PRECROP_CUSTOM_WIDTH);
+	converter->precrop_custom_height = (uint32_t)obs_data_get_int(settings, PROP_PRECROP_CUSTOM_HEIGHT);
+
+	// Validate pre-crop custom resolution
+	if (converter->precrop_custom_width < 128)
+		converter->precrop_custom_width = 128;
+	if (converter->precrop_custom_width > 7680)
+		converter->precrop_custom_width = 7680;
+	if (converter->precrop_custom_height < 72)
+		converter->precrop_custom_height = 72;
+	if (converter->precrop_custom_height > 4320)
+		converter->precrop_custom_height = 4320;
+
+	// Calculate pre-crop target resolution
+	if (converter->enable_precrop_resolution) {
+		if (converter->precrop_resolution_mode == NDI_RESOLUTION_CUSTOM) {
+			converter->precrop_target_width = converter->precrop_custom_width;
+			converter->precrop_target_height = converter->precrop_custom_height;
+		} else {
+			ndi_converter_get_preset_resolution(converter->precrop_resolution_mode,
+							    &converter->precrop_target_width,
+							    &converter->precrop_target_height);
+		}
+	} else {
+		converter->precrop_target_width = 0;
+		converter->precrop_target_height = 0;
+	}
+
+	// Post-crop resolution settings
 	converter->enable_custom_resolution = obs_data_get_bool(settings, PROP_ENABLE_CUSTOM_RES);
 	converter->resolution_mode = (enum ndi_resolution_mode)obs_data_get_int(settings, PROP_RESOLUTION_MODE);
 	converter->custom_width = (uint32_t)obs_data_get_int(settings, PROP_CUSTOM_WIDTH);
 	converter->custom_height = (uint32_t)obs_data_get_int(settings, PROP_CUSTOM_HEIGHT);
 	converter->scale_type = (enum ndi_scale_type)obs_data_get_int(settings, PROP_SCALE_TYPE);
 
-	// Validate custom resolution
+	// Validate post-crop custom resolution
 	if (converter->custom_width < 128)
 		converter->custom_width = 128;
 	if (converter->custom_width > 7680)
@@ -263,7 +301,7 @@ void ndi_converter_update(ndi_video_converter_t *converter, obs_data_t *settings
 	if (converter->custom_height > 4320)
 		converter->custom_height = 4320;
 
-	// Calculate target resolution
+	// Calculate post-crop target resolution
 	if (converter->enable_custom_resolution) {
 		if (converter->resolution_mode == NDI_RESOLUTION_CUSTOM) {
 			converter->target_width = converter->custom_width;

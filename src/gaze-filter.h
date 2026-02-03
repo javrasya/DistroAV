@@ -80,7 +80,8 @@ typedef struct gaze_output {
 	double crop_h_pct;                      // Height (percentage)
 
 	// GPU resources
-	gs_texrender_t *texrender;
+	gs_texrender_t *texrender;          // Post-crop resize
+	gs_texrender_t *texrender_precrop;  // Pre-crop resize (optional)
 	gs_stagesurf_t *stagesurface;
 	uint8_t *video_data;
 	uint32_t video_linesize;
