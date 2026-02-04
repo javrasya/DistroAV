@@ -40,6 +40,23 @@ static void close_socket(gaze_socket_t sock)
 #endif
 }
 
+// Cross-platform read-write lock helpers
+#ifdef _WIN32
+static void rwlock_init(SRWLOCK *lock) { InitializeSRWLock(lock); }
+static void rwlock_destroy(SRWLOCK *lock) { (void)lock; /* SRWLock needs no cleanup */ }
+static void rwlock_rdlock(SRWLOCK *lock) { AcquireSRWLockShared(lock); }
+static void rwlock_rdunlock(SRWLOCK *lock) { ReleaseSRWLockShared(lock); }
+static void rwlock_wrlock(SRWLOCK *lock) { AcquireSRWLockExclusive(lock); }
+static void rwlock_wrunlock(SRWLOCK *lock) { ReleaseSRWLockExclusive(lock); }
+#else
+static void rwlock_init(pthread_rwlock_t *lock) { pthread_rwlock_init(lock, nullptr); }
+static void rwlock_destroy(pthread_rwlock_t *lock) { pthread_rwlock_destroy(lock); }
+static void rwlock_rdlock(pthread_rwlock_t *lock) { pthread_rwlock_rdlock(lock); }
+static void rwlock_rdunlock(pthread_rwlock_t *lock) { pthread_rwlock_unlock(lock); }
+static void rwlock_wrlock(pthread_rwlock_t *lock) { pthread_rwlock_wrlock(lock); }
+static void rwlock_wrunlock(pthread_rwlock_t *lock) { pthread_rwlock_unlock(lock); }
+#endif
+
 // Set socket non-blocking
 static bool set_nonblocking(gaze_socket_t sock)
 {
@@ -173,6 +190,9 @@ static void prune_inactive_receivers(gaze_sender_t *sender)
 }
 
 // Handle PROBE message and send response
+// Optimized with two fast paths:
+// 1. Status-only: no locks, uses volatile atomic reads
+// 2. With frame: uses read lock on pre-built cache (no malloc/memcpy in hot path)
 static void handle_probe_message(gaze_sender_t *sender, const uint8_t *data,
 				 int len, struct sockaddr_in *from_addr)
 {
@@ -183,75 +203,122 @@ static void handle_probe_message(gaze_sender_t *sender, const uint8_t *data,
 	uint32_t request_id = gaze_ntohl(*(uint32_t *)(data + 4));
 	bool request_frame = (flags & GAZE_PROBE_FLAG_REQUEST_FRAME) != 0;
 
-	// Build response
-	// Max response size: header + potential keyframe
-	pthread_mutex_lock(&sender->keyframe_mutex);
+	char ip_str[INET_ADDRSTRLEN];
 
-	size_t frame_size = 0;
-	uint8_t *frame_data = nullptr;
-	uint32_t frame_width = 0;
-	uint32_t frame_height = 0;
+	// FAST PATH: Status-only probe (no frame requested)
+	// No locks needed - uses volatile reads for atomic access
+	if (!request_frame) {
+		uint8_t response[GAZE_PROBE_RESPONSE_HEADER_SIZE];
 
-	if (request_frame && sender->last_keyframe && sender->last_keyframe_size > 0) {
-		frame_size = sender->last_keyframe_size;
-		frame_data = sender->last_keyframe;
-		frame_width = sender->last_keyframe_width;
-		frame_height = sender->last_keyframe_height;
-	}
+		// Build header
+		response[0] = GAZE_CTRL_MAGIC_0;
+		response[1] = GAZE_CTRL_MAGIC_1;
+		response[2] = GAZE_CTRL_PROBE_RESPONSE;
 
-	size_t response_size = GAZE_PROBE_RESPONSE_HEADER_SIZE + frame_size;
-	uint8_t *response = (uint8_t *)malloc(response_size);
-	if (!response) {
-		pthread_mutex_unlock(&sender->keyframe_mutex);
+		// Status flags (volatile reads - atomic on all platforms)
+		uint8_t status = 0;
+		if (sender->stream_active)
+			status |= GAZE_PROBE_STATUS_ACTIVE;
+		if (sender->receiver_count > 0)
+			status |= GAZE_PROBE_STATUS_HAS_RECEIVERS;
+		// No frame included
+		response[3] = status;
+
+		// Request ID (echoed)
+		*(uint32_t *)(response + 4) = gaze_htonl(request_id);
+
+		// Stream info
+		*(uint16_t *)(response + 8) = gaze_htons(sender->stream_info.width);
+		*(uint16_t *)(response + 10) = gaze_htons(sender->stream_info.height);
+		*(uint16_t *)(response + 12) = gaze_htons(sender->stream_info.fps_num);
+		*(uint16_t *)(response + 14) = gaze_htons(sender->stream_info.fps_den);
+
+		// Frame count (volatile read)
+		*(uint32_t *)(response + 16) = gaze_htonl(sender->frame_count);
+
+		// Frame data size = 0
+		*(uint32_t *)(response + 20) = 0;
+
+		// Send response
+		sendto(sender->rtcp_socket, (const char *)response,
+		       GAZE_PROBE_RESPONSE_HEADER_SIZE, 0,
+		       (struct sockaddr *)from_addr, sizeof(*from_addr));
+
+		inet_ntop(AF_INET, &from_addr->sin_addr, ip_str, sizeof(ip_str));
+		obs_log(LOG_DEBUG,
+			"[gaze-sender] Probe response (status-only) sent to %s:%d (status=0x%02x)",
+			ip_str, ntohs(from_addr->sin_port), status);
 		return;
 	}
 
-	// Build header
-	response[0] = GAZE_CTRL_MAGIC_0;
-	response[1] = GAZE_CTRL_MAGIC_1;
-	response[2] = GAZE_CTRL_PROBE_RESPONSE;
+	// FRAME PATH: Use pre-built cache with read lock
+	rwlock_rdlock(&sender->probe_cache_lock);
 
-	// Status flags
-	uint8_t status = 0;
+	int active_idx = sender->probe_cache_active;
+	gaze_probe_cache_t *cache = &sender->probe_cache[active_idx];
+
+	if (!cache->response || cache->response_size == 0) {
+		// No cached frame available - send status-only response
+		rwlock_rdunlock(&sender->probe_cache_lock);
+
+		uint8_t response[GAZE_PROBE_RESPONSE_HEADER_SIZE];
+		response[0] = GAZE_CTRL_MAGIC_0;
+		response[1] = GAZE_CTRL_MAGIC_1;
+		response[2] = GAZE_CTRL_PROBE_RESPONSE;
+
+		uint8_t status = 0;
+		if (sender->stream_active)
+			status |= GAZE_PROBE_STATUS_ACTIVE;
+		if (sender->receiver_count > 0)
+			status |= GAZE_PROBE_STATUS_HAS_RECEIVERS;
+		response[3] = status;
+
+		*(uint32_t *)(response + 4) = gaze_htonl(request_id);
+		*(uint16_t *)(response + 8) = gaze_htons(sender->stream_info.width);
+		*(uint16_t *)(response + 10) = gaze_htons(sender->stream_info.height);
+		*(uint16_t *)(response + 12) = gaze_htons(sender->stream_info.fps_num);
+		*(uint16_t *)(response + 14) = gaze_htons(sender->stream_info.fps_den);
+		*(uint32_t *)(response + 16) = gaze_htonl(sender->frame_count);
+		*(uint32_t *)(response + 20) = 0;
+
+		sendto(sender->rtcp_socket, (const char *)response,
+		       GAZE_PROBE_RESPONSE_HEADER_SIZE, 0,
+		       (struct sockaddr *)from_addr, sizeof(*from_addr));
+
+		inet_ntop(AF_INET, &from_addr->sin_addr, ip_str, sizeof(ip_str));
+		obs_log(LOG_DEBUG,
+			"[gaze-sender] Probe response (no frame cached) sent to %s:%d",
+			ip_str, ntohs(from_addr->sin_port));
+		return;
+	}
+
+	// Patch the pre-built response with current request_id and status
+	// We modify bytes 3-7 (status byte and request_id) before sending
+	// The frame data at offset 24+ is already correct in the cache
+	uint8_t *response = cache->response;
+	size_t response_size = cache->response_size;
+	size_t frame_size = response_size - GAZE_PROBE_RESPONSE_HEADER_SIZE;
+
+	// Update status flags (volatile reads for current state)
+	uint8_t status = GAZE_PROBE_STATUS_FRAME_INCLUDED;  // Frame is included
 	if (sender->stream_active)
 		status |= GAZE_PROBE_STATUS_ACTIVE;
 	if (sender->receiver_count > 0)
 		status |= GAZE_PROBE_STATUS_HAS_RECEIVERS;
-	if (frame_size > 0)
-		status |= GAZE_PROBE_STATUS_FRAME_INCLUDED;
 	response[3] = status;
 
-	// Request ID (echoed)
+	// Update request ID
 	*(uint32_t *)(response + 4) = gaze_htonl(request_id);
 
-	// Stream info - use cached frame dimensions if available, else stream_info
-	uint16_t width = frame_width > 0 ? (uint16_t)frame_width : sender->stream_info.width;
-	uint16_t height = frame_height > 0 ? (uint16_t)frame_height : sender->stream_info.height;
-	*(uint16_t *)(response + 8) = gaze_htons(width);
-	*(uint16_t *)(response + 10) = gaze_htons(height);
-	*(uint16_t *)(response + 12) = gaze_htons(sender->stream_info.fps_num);
-	*(uint16_t *)(response + 14) = gaze_htons(sender->stream_info.fps_den);
-
-	// Frame count
+	// Update frame count (volatile read)
 	*(uint32_t *)(response + 16) = gaze_htonl(sender->frame_count);
 
-	// Frame data size
-	*(uint32_t *)(response + 20) = gaze_htonl((uint32_t)frame_size);
-
-	// Copy frame data if included
-	if (frame_size > 0 && frame_data) {
-		memcpy(response + GAZE_PROBE_RESPONSE_HEADER_SIZE, frame_data, frame_size);
-	}
-
-	pthread_mutex_unlock(&sender->keyframe_mutex);
-
-	// Send response back to requester
+	// Send pre-built response directly (no copy needed)
 	sendto(sender->rtcp_socket, (const char *)response, (int)response_size, 0,
 	       (struct sockaddr *)from_addr, sizeof(*from_addr));
 
-	free(response);
+	rwlock_rdunlock(&sender->probe_cache_lock);
 
-	char ip_str[INET_ADDRSTRLEN];
 	inet_ntop(AF_INET, &from_addr->sin_addr, ip_str, sizeof(ip_str));
 	obs_log(LOG_DEBUG,
 		"[gaze-sender] Probe response sent to %s:%d (status=0x%02x, frame=%zu bytes)",
@@ -404,12 +471,16 @@ bool gaze_sender_init(gaze_sender_t *sender, uint16_t rtp_port,
 	// Initialize receiver mutex
 	pthread_mutex_init(&sender->receiver_mutex, nullptr);
 
-	// Initialize keyframe mutex and cache
-	pthread_mutex_init(&sender->keyframe_mutex, nullptr);
-	sender->last_keyframe = nullptr;
-	sender->last_keyframe_size = 0;
-	sender->last_keyframe_width = 0;
-	sender->last_keyframe_height = 0;
+	// Initialize double-buffered probe cache
+	rwlock_init(&sender->probe_cache_lock);
+	sender->probe_cache_active = 0;
+	for (int i = 0; i < 2; i++) {
+		sender->probe_cache[i].response = nullptr;
+		sender->probe_cache[i].response_size = 0;
+		sender->probe_cache[i].capacity = 0;
+		sender->probe_cache[i].frame_width = 0;
+		sender->probe_cache[i].frame_height = 0;
+	}
 	sender->frame_count = 0;
 	sender->stream_active = false;
 	memset(&sender->stream_info, 0, sizeof(sender->stream_info));
@@ -421,7 +492,7 @@ bool gaze_sender_init(gaze_sender_t *sender, uint16_t rtp_port,
 		obs_log(LOG_ERROR,
 			"[gaze-sender] Failed to create control thread");
 		pthread_mutex_destroy(&sender->receiver_mutex);
-		pthread_mutex_destroy(&sender->keyframe_mutex);
+		rwlock_destroy(&sender->probe_cache_lock);
 		close_socket(sender->rtp_socket);
 		close_socket(sender->rtcp_socket);
 		sender->rtp_socket = GAZE_INVALID_SOCKET;
@@ -532,15 +603,18 @@ void gaze_sender_destroy(gaze_sender_t *sender)
 
 	pthread_mutex_destroy(&sender->receiver_mutex);
 
-	// Free cached keyframe
-	pthread_mutex_lock(&sender->keyframe_mutex);
-	if (sender->last_keyframe) {
-		free(sender->last_keyframe);
-		sender->last_keyframe = nullptr;
-		sender->last_keyframe_size = 0;
+	// Free double-buffered probe cache
+	rwlock_wrlock(&sender->probe_cache_lock);
+	for (int i = 0; i < 2; i++) {
+		if (sender->probe_cache[i].response) {
+			free(sender->probe_cache[i].response);
+			sender->probe_cache[i].response = nullptr;
+			sender->probe_cache[i].response_size = 0;
+			sender->probe_cache[i].capacity = 0;
+		}
 	}
-	pthread_mutex_unlock(&sender->keyframe_mutex);
-	pthread_mutex_destroy(&sender->keyframe_mutex);
+	rwlock_wrunlock(&sender->probe_cache_lock);
+	rwlock_destroy(&sender->probe_cache_lock);
 
 	// Close sockets
 	close_socket(sender->rtcp_socket);
@@ -557,24 +631,58 @@ void gaze_sender_cache_keyframe(gaze_sender_t *sender, const uint8_t *data,
 	if (!sender || !sender->initialized || !data || size == 0)
 		return;
 
-	pthread_mutex_lock(&sender->keyframe_mutex);
+	// Build complete probe response into the INACTIVE buffer
+	// This happens outside the critical section for minimal lock hold time
+	int inactive_idx = 1 - sender->probe_cache_active;
+	gaze_probe_cache_t *cache = &sender->probe_cache[inactive_idx];
 
-	// Reallocate buffer if needed
-	if (sender->last_keyframe_size < size) {
-		uint8_t *new_buf = (uint8_t *)realloc(sender->last_keyframe, size);
+	size_t response_size = GAZE_PROBE_RESPONSE_HEADER_SIZE + size;
+
+	// Reallocate buffer if needed (outside lock)
+	if (cache->capacity < response_size) {
+		size_t new_capacity = response_size + (response_size / 4);  // 25% extra
+		uint8_t *new_buf = (uint8_t *)realloc(cache->response, new_capacity);
 		if (!new_buf) {
-			pthread_mutex_unlock(&sender->keyframe_mutex);
-			return;
+			return;  // Allocation failed, keep old cache
 		}
-		sender->last_keyframe = new_buf;
+		cache->response = new_buf;
+		cache->capacity = new_capacity;
 	}
 
-	memcpy(sender->last_keyframe, data, size);
-	sender->last_keyframe_size = size;
-	sender->last_keyframe_width = width;
-	sender->last_keyframe_height = height;
+	// Build the complete response header
+	uint8_t *response = cache->response;
+	response[0] = GAZE_CTRL_MAGIC_0;
+	response[1] = GAZE_CTRL_MAGIC_1;
+	response[2] = GAZE_CTRL_PROBE_RESPONSE;
+	response[3] = 0;  // Status flags - will be patched at send time
 
-	pthread_mutex_unlock(&sender->keyframe_mutex);
+	// Request ID placeholder (will be patched at send time)
+	*(uint32_t *)(response + 4) = 0;
+
+	// Stream info - use frame dimensions
+	*(uint16_t *)(response + 8) = gaze_htons((uint16_t)width);
+	*(uint16_t *)(response + 10) = gaze_htons((uint16_t)height);
+	*(uint16_t *)(response + 12) = gaze_htons(sender->stream_info.fps_num);
+	*(uint16_t *)(response + 14) = gaze_htons(sender->stream_info.fps_den);
+
+	// Frame count placeholder (will be patched at send time)
+	*(uint32_t *)(response + 16) = 0;
+
+	// Frame data size
+	*(uint32_t *)(response + 20) = gaze_htonl((uint32_t)size);
+
+	// Copy frame data
+	memcpy(response + GAZE_PROBE_RESPONSE_HEADER_SIZE, data, size);
+
+	// Update cache metadata
+	cache->response_size = response_size;
+	cache->frame_width = width;
+	cache->frame_height = height;
+
+	// Atomic swap: briefly hold write lock to update active index
+	rwlock_wrlock(&sender->probe_cache_lock);
+	sender->probe_cache_active = inactive_idx;
+	rwlock_wrunlock(&sender->probe_cache_lock);
 }
 
 void gaze_sender_set_stream_info(gaze_sender_t *sender, uint16_t width,

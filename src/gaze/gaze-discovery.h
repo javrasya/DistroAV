@@ -38,6 +38,7 @@ extern "C" {
  * - height: video height
  * - fps: frame rate
  * - version: protocol version
+ * - ip: IPv4 address (when bound to specific interface)
  */
 
 /**
@@ -55,6 +56,7 @@ typedef struct gaze_discovery {
 	uint32_t height;
 	uint32_t fps;
 	uint32_t if_index;  // Network interface index (0 = all)
+	uint32_t ip_addr;   // IPv4 address in network byte order (0 = any)
 
 	bool registered;
 	bool initialized;
@@ -79,12 +81,13 @@ bool gaze_discovery_init(gaze_discovery_t *disc);
  * @param height Video height
  * @param fps Frame rate
  * @param if_index Network interface index (0 = all interfaces)
+ * @param ip_addr IPv4 address in network byte order (0 = any interface)
  * @return true on success, false on failure
  */
 bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 			     uint16_t port, gaze_codec_t codec,
 			     uint32_t width, uint32_t height, uint32_t fps,
-			     uint32_t if_index);
+			     uint32_t if_index, uint32_t ip_addr);
 
 /**
  * Update service info.

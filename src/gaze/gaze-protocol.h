@@ -167,10 +167,10 @@ typedef struct gaze_frame_meta {
  * First packet of each frame contains this header
  */
 typedef struct gaze_frame_header {
-	uint8_t header_type;          // gaze_packet_type_t
-	uint8_t frame_type;           // gaze_frame_type_t
-	uint16_t flags;               // Reserved flags (big-endian)
-	uint32_t capture_timestamp_ms; // Capture time for latency measurement (big-endian)
+	uint8_t header_type;        // gaze_packet_type_t
+	uint8_t frame_type;         // gaze_frame_type_t
+	uint16_t flags;             // Reserved flags (big-endian)
+	uint32_t capture_timestamp; // Capture time in 100ns units for NDI compat (big-endian)
 } gaze_frame_header_t;
 
 /**

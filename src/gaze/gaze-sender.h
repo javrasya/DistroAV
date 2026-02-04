@@ -82,6 +82,21 @@ typedef struct gaze_stream_info {
 } gaze_stream_info_t;
 
 /**
+ * Pre-built probe response cache (for double-buffering)
+ *
+ * Pre-builds the complete probe response (header + keyframe) so that
+ * probe handlers can send without holding the keyframe mutex during
+ * malloc/memcpy operations.
+ */
+typedef struct gaze_probe_cache {
+	uint8_t *response;      // Pre-built: header (24 bytes) + frame data
+	size_t response_size;   // Total size including header
+	size_t capacity;        // Allocated capacity
+	uint32_t frame_width;   // Cached frame dimensions
+	uint32_t frame_height;
+} gaze_probe_cache_t;
+
+/**
  * Sender state
  */
 typedef struct gaze_sender {
@@ -102,17 +117,20 @@ typedef struct gaze_sender {
 	pthread_t control_thread;
 	volatile bool control_running;
 
-	// Probe response: cached keyframe
-	uint8_t *last_keyframe;
-	size_t last_keyframe_size;
-	uint32_t last_keyframe_width;
-	uint32_t last_keyframe_height;
-	pthread_mutex_t keyframe_mutex;
+	// Double-buffered probe response cache
+	// Buffer 0 or 1 is active; encoder writes to inactive, then swaps
+	gaze_probe_cache_t probe_cache[2];
+	volatile int probe_cache_active;  // 0 or 1, index of active buffer
+#ifdef _WIN32
+	SRWLOCK probe_cache_lock;  // Slim reader-writer lock on Windows
+#else
+	pthread_rwlock_t probe_cache_lock;  // Read-write lock for cache access
+#endif
 
-	// Stream info for probe responses
+	// Stream info for probe responses (atomic access for status-only probes)
 	gaze_stream_info_t stream_info;
-	uint32_t frame_count;
-	bool stream_active;
+	volatile uint32_t frame_count;
+	volatile bool stream_active;
 
 	// Statistics
 	gaze_sender_stats_t stats;

@@ -123,17 +123,17 @@ static void build_frame_meta(gaze_frame_meta_t *meta, uint32_t frame_index,
 
 static void build_frame_header(gaze_frame_header_t *hdr, gaze_packet_type_t type,
 			       gaze_frame_type_t frame_type,
-			       uint32_t capture_timestamp_ms)
+			       uint32_t capture_timestamp)
 {
 	hdr->header_type = (uint8_t)type;
 	hdr->frame_type = (uint8_t)frame_type;
 	hdr->flags = 0;
-	hdr->capture_timestamp_ms = gaze_htonl(capture_timestamp_ms);
+	hdr->capture_timestamp = gaze_htonl(capture_timestamp);
 }
 
 bool gaze_packetizer_packetize(gaze_packetizer_t *pkt,
 			       const uint8_t *encoded_data, size_t encoded_size,
-			       bool is_keyframe, uint32_t capture_timestamp_ms,
+			       bool is_keyframe, uint32_t capture_timestamp,
 			       gaze_packet_t **packets, size_t *packet_count)
 {
 	if (!pkt || !pkt->initialized || !encoded_data || encoded_size == 0 ||
@@ -221,7 +221,7 @@ bool gaze_packetizer_packetize(gaze_packetizer_t *pkt,
 
 				build_frame_header(&hdr->frame, pkt_type,
 						   frame_type,
-						   capture_timestamp_ms);
+						   capture_timestamp);
 
 				// Copy shard data
 				size_t payload_size = blk->shard_size;
@@ -270,7 +270,7 @@ bool gaze_packetizer_packetize(gaze_packetizer_t *pkt,
 					 0);
 
 			build_frame_header(&hdr->frame, GAZE_PACKET_TYPE_VIDEO,
-					   frame_type, capture_timestamp_ms);
+					   frame_type, capture_timestamp);
 
 			memcpy(packet->data + GAZE_PACKET_HEADER_SIZE,
 			       encoded_data + offset, payload_size);

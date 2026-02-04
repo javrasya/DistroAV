@@ -35,30 +35,33 @@ class ReceivedFrame:
     frame_index: int
     frame_type: GazeFrameType
     codec: GazeCodec
-    capture_timestamp_ms: int
-    receive_timestamp_ms: int
-    assembly_start_ms: int  # When first packet arrived
+    capture_timestamp: int  # 100ns units for NDI compatibility
+    receive_timestamp: int  # 100ns units for NDI compatibility
+    assembly_start: int     # 100ns units, when first packet arrived
     data: bytes
     is_keyframe: bool
 
     @property
     def freshness_ms(self) -> float:
-        """Calculate end-to-end latency (capture to receive)"""
+        """Calculate end-to-end latency (capture to receive) in milliseconds"""
         # Note: Requires synchronized clocks for accuracy across machines
         # On same machine, this gives true capture-to-receive latency
-        diff = self.receive_timestamp_ms - self.capture_timestamp_ms
-        # Small negative values (within -100ms) are due to timing jitter, treat as ~0
+        # Timestamps are in 100ns units, convert diff to ms
+        diff = self.receive_timestamp - self.capture_timestamp
+        # Small negative values (within -1,000,000 100ns units = -100ms) are due to timing jitter
         # Large negative values indicate uint32 wrap-around
-        if diff < -100:
+        if diff < -1_000_000:
             diff += 0x100000000  # Add 2^32 to handle wrap-around
         elif diff < 0:
             diff = 0  # Timing jitter, treat as minimal latency
-        return diff
+        # Convert from 100ns units to milliseconds (divide by 10,000)
+        return diff / 10_000.0
 
     @property
     def assembly_ms(self) -> float:
-        """Calculate assembly latency (first packet to frame complete)"""
-        return self.receive_timestamp_ms - self.assembly_start_ms
+        """Calculate assembly latency (first packet to frame complete) in milliseconds"""
+        # Convert from 100ns units to milliseconds
+        return (self.receive_timestamp - self.assembly_start) / 10_000.0
 
 
 @dataclass
@@ -67,12 +70,12 @@ class FrameAssembler:
     frame_index: int
     codec: GazeCodec
     frame_type: GazeFrameType
-    capture_timestamp_ms: int
+    capture_timestamp: int  # 100ns units for NDI compatibility
     packets: Dict[int, bytes] = field(default_factory=dict)
     fec_seqs: set = field(default_factory=set)  # Track FEC packet sequence numbers
     total_data_packets: int = 0  # Expected data packets (from FEC metadata)
     received_marker: bool = False
-    start_time_ms: int = 0
+    start_time: int = 0  # 100ns units, when first packet arrived
     # Track FEC block info: {block_index: (data_shards, parity_shards)}
     block_info: Dict[int, tuple] = field(default_factory=dict)
 
@@ -264,7 +267,8 @@ class GazeReceiver:
 
         frame_idx = packet.meta.frame_index
         # Use uint32 truncation to match sender's timestamp format
-        receive_time_ms = int(time.time() * 1000) & 0xFFFFFFFF
+        # Use 100ns units (10,000,000 per second) for NDI compatibility
+        receive_time = int(time.time() * 10_000_000) & 0xFFFFFFFF
 
         # Track FEC packets (we skip them but need to know their seq numbers for completeness check)
         if packet.is_fec:
@@ -293,8 +297,8 @@ class GazeReceiver:
                 frame_index=frame_idx,
                 codec=packet.codec,
                 frame_type=packet.frame.frame_type,
-                capture_timestamp_ms=packet.frame.capture_timestamp_ms,
-                start_time_ms=receive_time_ms,
+                capture_timestamp=packet.frame.capture_timestamp,
+                start_time=receive_time,
             )
 
         assembler = self._assemblers[frame_idx]
@@ -302,12 +306,12 @@ class GazeReceiver:
 
         # Check if frame is complete
         if assembler.is_complete():
-            self._complete_frame(assembler, receive_time_ms)
+            self._complete_frame(assembler, receive_time)
 
         # Cleanup old assemblers
         self._cleanup_assemblers(frame_idx)
 
-    def _complete_frame(self, assembler: FrameAssembler, receive_time_ms: int) -> None:
+    def _complete_frame(self, assembler: FrameAssembler, receive_time: int) -> None:
         """Handle a completed frame"""
         frame_data = assembler.assemble()
 
@@ -317,9 +321,9 @@ class GazeReceiver:
             frame_index=assembler.frame_index,
             frame_type=assembler.frame_type,
             codec=assembler.codec,
-            capture_timestamp_ms=assembler.capture_timestamp_ms,
-            receive_timestamp_ms=receive_time_ms,
-            assembly_start_ms=assembler.start_time_ms,
+            capture_timestamp=assembler.capture_timestamp,
+            receive_timestamp=receive_time,
+            assembly_start=assembler.start_time,
             data=frame_data,
             is_keyframe=is_keyframe,
         )
@@ -369,8 +373,8 @@ class GazeReceiver:
 def probe_stream(
     host: str,
     port: int,
-    request_frame: bool = True,
-    timeout: float = 1.0,
+    request_frame: bool = False,
+    timeout: float = 0.5,
 ) -> Optional[GazeProbeResponse]:
     """
     Probe a Gaze stream to check its status and optionally get a preview frame.
@@ -381,8 +385,10 @@ def probe_stream(
     Args:
         host: IP address of the sender
         port: RTP port of the stream
-        request_frame: If True, request a keyframe in the response
-        timeout: Timeout in seconds for response
+        request_frame: If True, request a keyframe in the response (slower, larger response)
+                       Defaults to False for fast status-only probes.
+        timeout: Timeout in seconds for response. Defaults to 0.5s for status-only,
+                 increase to 2.0s+ when requesting frames.
 
     Returns:
         GazeProbeResponse if successful, None if no response or error

@@ -142,21 +142,12 @@ static void gaze_output_raw_video(void *data, struct video_data *frame)
 
 	// Convert OBS frame timestamp to wall clock for latency measurement
 	// frame->timestamp is closer to actual capture time than current wall clock
-	int64_t obs_ts_ms = (int64_t)(frame->timestamp / 1000000);
-	uint32_t capture_ts_ms = (uint32_t)(obs_ts_ms + f->timestamp_offset_ms);
+	// Use 100ns units (10,000,000 per second) for NDI compatibility
+	int64_t obs_ts_100ns = (int64_t)(frame->timestamp / 100);
+	uint32_t capture_ts = (uint32_t)(obs_ts_100ns + f->timestamp_offset_100ns);
 
-	// Reduce logging overhead - only log every 300 frames (5 seconds at 60fps)
-	static int raw_video_count = 0;
-	raw_video_count++;
-
-	// FPS gating
-	int frames_to_send = 1;
-	if (out->converter.enable_custom_framerate && frame) {
-		bool should_send = ndi_converter_should_send_frame(
-			&out->converter, frame->timestamp, &frames_to_send);
-		if (!should_send || frames_to_send == 0)
-			return;
-	}
+	// FPS gating is now done at the GPU render stage (gaze_filter_render_video)
+	// Every frame that arrives here has already passed the FPS check
 
 	// Note: CPU crop path was removed - it caused crashes because the encoder's
 	// sws_ctx dimensions wouldn't match the cropped dimensions.
@@ -209,12 +200,12 @@ static void gaze_output_raw_video(void *data, struct video_data *frame)
 	// Increment frame count for probe stats
 	gaze_sender_increment_frame_count(&out->sender);
 
-	// Packetize (using capture_ts_ms from start of processing)
+	// Packetize (using capture_ts from start of processing)
 	gaze_packet_t *packets = nullptr;
 	size_t packet_count = 0;
 
 	if (!gaze_packetizer_packetize(&out->packetizer, encoded_data,
-				       encoded_size, is_keyframe, capture_ts_ms,
+				       encoded_size, is_keyframe, capture_ts,
 				       &packets, &packet_count)) {
 		pthread_mutex_unlock(&out->output_mutex);
 		return;
@@ -299,9 +290,9 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 {
 	// Convert OBS timestamp to wall clock for latency measurement
 	// OBS timestamp is closer to actual frame capture time than current wall clock
-	// timestamp (ns) -> ms, then add offset to convert to wall clock
-	int64_t obs_ts_ms = (int64_t)(timestamp / 1000000);
-	uint32_t capture_ts_ms = (uint32_t)(obs_ts_ms + f->timestamp_offset_ms);
+	// Use 100ns units (10,000,000 per second) for NDI compatibility
+	int64_t obs_ts_100ns = (int64_t)(timestamp / 100);
+	uint32_t capture_ts = (uint32_t)(obs_ts_100ns + f->timestamp_offset_100ns);
 
 	// Step 1: Determine pre-crop dimensions
 	// If pre-crop resolution is enabled, we first scale the source to that size
@@ -385,7 +376,7 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 		}
 
 		gaze_encoder_init(&out->encoder, f->codec, f->encoder_type,
-				  render_width, render_height, f->bitrate_kbps,
+				  render_width, render_height, out->bitrate_kbps,
 				  fps_num, fps_den, GAZE_DEFAULT_KEYFRAME_INTERVAL);
 		// Request keyframe after encoder (re)creation
 		out->keyframe_requested = true;
@@ -404,7 +395,8 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 						out->rtp_port, f->codec,
 						render_width, render_height,
 						fps_num / fps_den,
-						f->network_if_index);
+						f->network_if_index,
+						f->network_bind_addr);
 		} else {
 			gaze_discovery_update(&out->discovery, render_width,
 					      render_height, fps_num / fps_den);
@@ -412,6 +404,24 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 
 		out->known_width = render_width;
 		out->known_height = render_height;
+	}
+
+	// Register discovery if not yet registered (handles case where discovery
+	// was re-initialized after dimensions were already known, e.g. network change)
+	if (!out->discovery.registered && out->discovery.initialized) {
+		uint32_t fps_num = f->ovi.fps_num;
+		uint32_t fps_den = f->ovi.fps_den;
+		if (out->converter.enable_custom_framerate &&
+		    out->converter.target_fps_num > 0) {
+			fps_num = out->converter.target_fps_num;
+			fps_den = out->converter.target_fps_den;
+		}
+		gaze_discovery_register(&out->discovery, out->stream_name,
+					out->rtp_port, f->codec,
+					render_width, render_height,
+					fps_num / fps_den,
+					f->network_if_index,
+					f->network_bind_addr);
 	}
 
 	// Ensure video_output exists
@@ -551,13 +561,13 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 		// Increment frame count for probe stats
 		gaze_sender_increment_frame_count(&out->sender);
 
-		// Packetize and send (using capture_ts_ms from start of processing)
+		// Packetize and send (using capture_ts from start of processing)
 		gaze_packet_t *packets = nullptr;
 		size_t packet_count = 0;
 
 		if (gaze_packetizer_packetize(&out->packetizer, encoded_data,
 					      encoded_size, is_keyframe,
-					      capture_ts_ms, &packets,
+					      capture_ts, &packets,
 					      &packet_count)) {
 			if (packet_count > 0) {
 				gaze_sender_send_packets(&out->sender, packets,
@@ -648,11 +658,17 @@ static void gaze_filter_render_video(void *data, gs_effect_t *)
 		}
 
 		// FPS gating - skip GPU work for frames that will be dropped
-		if (out->converter.enable_custom_framerate &&
-		    !ndi_converter_should_render_frame_peek(&out->converter,
-							    timestamp)) {
-			fps_fail++;
-			continue;
+		// Use the mutating version to track timing state at the beginning of pipeline
+		// This is the ONLY FPS gating point - video_output callback does not filter
+		if (out->converter.enable_custom_framerate) {
+			int frames_to_send = 0;
+			if (!ndi_converter_should_send_frame(&out->converter,
+							     timestamp,
+							     &frames_to_send) ||
+			    frames_to_send == 0) {
+				fps_fail++;
+				continue;
+			}
 		}
 
 		process_single_output(f, out, target, parent, width, height,
@@ -727,8 +743,8 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 	}
 
 	// Initialize packetizer
-	bool fec_enabled = f->fec_percent > 0;
-	if (!gaze_packetizer_init(&out->packetizer, fec_enabled, f->fec_percent,
+	bool fec_enabled = out->fec_percent > 0;
+	if (!gaze_packetizer_init(&out->packetizer, fec_enabled, out->fec_percent,
 				  f->codec)) {
 		obs_log(LOG_ERROR,
 			"[gaze-filter] Failed to init packetizer for output %d",
@@ -741,8 +757,10 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 	// Encoder will be initialized when we know the dimensions
 	// (in process_single_output)
 
-	// Initialize discovery (registration deferred until we know dimensions)
-	gaze_discovery_init(&out->discovery);
+	// Initialize discovery if not already initialized (may be preserved across updates)
+	if (!out->discovery.initialized) {
+		gaze_discovery_init(&out->discovery);
+	}
 
 	// Store service info for later registration when dimensions are known
 	strncpy(out->discovery.service_name, out->stream_name,
@@ -750,6 +768,7 @@ static bool output_init_components(gaze_output_t *out, gaze_filter_t *f)
 	out->discovery.port = out->rtp_port;
 	out->discovery.codec = f->codec;
 	out->discovery.if_index = f->network_if_index;
+	out->discovery.ip_addr = f->network_bind_addr;
 
 	// Set sender as active (stream is producing frames)
 	gaze_sender_set_active(&out->sender, true);
@@ -808,6 +827,67 @@ static void add_output_properties(obs_properties_t *props, int index)
 	obs_properties_add_text(group, prop_name,
 				obs_module_text("GazePlugin.StreamName"),
 				OBS_TEXT_DEFAULT);
+
+	// === Quality preset group (per-output override) ===
+	obs_properties_t *group_quality = obs_properties_create();
+
+	char quality_preset_name[128];
+	build_prop_name(quality_preset_name, sizeof(quality_preset_name), index,
+			"quality_preset");
+	auto out_quality_list = obs_properties_add_list(
+		group_quality, quality_preset_name,
+		obs_module_text("GazePlugin.QualityPreset"), OBS_COMBO_TYPE_LIST,
+		OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(out_quality_list, "Use Global", -1);
+	obs_property_list_add_int(out_quality_list, "Ultra (25 Mbps)", 0);
+	obs_property_list_add_int(out_quality_list, "High (15 Mbps)", 1);
+	obs_property_list_add_int(out_quality_list, "Balanced (10 Mbps)", 2);
+	obs_property_list_add_int(out_quality_list, "Low (5 Mbps)", 3);
+	obs_property_list_add_int(out_quality_list, "Custom...", 4);
+
+	// Custom bitrate (visible only when Custom selected)
+	build_prop_name(prop_name, sizeof(prop_name), index, "bitrate");
+	obs_properties_add_int(group_quality, prop_name,
+			       obs_module_text("GazePlugin.Bitrate"),
+			       GAZE_MIN_BITRATE_KBPS, GAZE_MAX_BITRATE_KBPS,
+			       1000);
+
+	// Custom FEC % (visible only when Custom selected)
+	build_prop_name(prop_name, sizeof(prop_name), index, "fec_percent");
+	obs_properties_add_int(group_quality, prop_name,
+			       obs_module_text("GazePlugin.FECPercent"), 0,
+			       GAZE_FEC_MAX_PERCENT, 5);
+
+	snprintf(grp, sizeof(grp), "gaze_output_%d_quality", index + 1);
+	obs_properties_add_group(group, grp,
+				 obs_module_text("GazePlugin.QualityPreset"),
+				 OBS_GROUP_NORMAL, group_quality);
+
+	// Show/hide custom quality fields based on preset selection
+	obs_property_set_modified_callback2(
+		out_quality_list,
+		[](void *priv, obs_properties_t *props, obs_property_t *,
+		   obs_data_t *settings) {
+			int idx = (int)(intptr_t)priv;
+			char preset_prop[128], bitrate_prop[128], fec_prop[128];
+			snprintf(preset_prop, sizeof(preset_prop),
+				 "gaze_output_%d_quality_preset", idx + 1);
+			snprintf(bitrate_prop, sizeof(bitrate_prop),
+				 "gaze_output_%d_bitrate", idx + 1);
+			snprintf(fec_prop, sizeof(fec_prop),
+				 "gaze_output_%d_fec_percent", idx + 1);
+
+			int preset = (int)obs_data_get_int(settings, preset_prop);
+			bool is_custom = (preset == 4);
+
+			obs_property_set_visible(
+				obs_properties_get(props, bitrate_prop),
+				is_custom);
+			obs_property_set_visible(
+				obs_properties_get(props, fec_prop), is_custom);
+			return true;
+		},
+		(void *)(intptr_t)index);
 
 	// === Frame Rate group (first in processing pipeline) ===
 	obs_properties_t *group_fps = obs_properties_create();
@@ -1244,6 +1324,14 @@ static void set_output_defaults(obs_data_t *d, int i)
 	snprintf(name, sizeof(name), "Gaze Stream %d", i + 1);
 	obs_data_set_default_string(d, p, name);
 
+	// Per-output quality defaults
+	build_prop_name(p, sizeof(p), i, "quality_preset");
+	obs_data_set_default_int(d, p, -1); // Use Global by default
+	build_prop_name(p, sizeof(p), i, "bitrate");
+	obs_data_set_default_int(d, p, GAZE_PRESET_HIGH_BITRATE);
+	build_prop_name(p, sizeof(p), i, "fec_percent");
+	obs_data_set_default_int(d, p, GAZE_PRESET_HIGH_FEC);
+
 	// Pre-crop resolution defaults
 	build_prop_name(p, sizeof(p), i, "precrop_resolution_mode");
 	obs_data_set_default_int(d, p, -1); // Auto (Source)
@@ -1318,6 +1406,11 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 {
 	char p[128];
 
+	// Read enabled state FIRST to decide whether to preserve discovery
+	build_prop_name(p, sizeof(p), i, "enabled");
+	bool new_enabled = obs_data_get_bool(s, p);
+	bool was_enabled = out->enabled;
+
 	// Stop video_output first
 	if (out->video_output) {
 		video_output_stop(out->video_output);
@@ -1330,12 +1423,34 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 	out->probe_keyframe_cached = false;
 	out->last_probe_refresh_ns = 0;
 
-	// Destroy existing components
-	output_destroy_components(out);
+	// Preserve discovery if output stays enabled AND network interface unchanged
+	// This fixes the bug where enabling Stream 2 would destroy Stream 1's mDNS
+	// But we must recreate discovery if the network interface changed
+	bool network_changed = out->discovery.initialized &&
+			       out->discovery.ip_addr != f->network_bind_addr;
+	bool preserve_discovery = was_enabled && new_enabled &&
+				  out->discovery.initialized && !network_changed;
 
-	// Read settings
-	build_prop_name(p, sizeof(p), i, "enabled");
-	out->enabled = obs_data_get_bool(s, p);
+	// Destroy existing components (but preserve discovery if staying enabled)
+	if (!preserve_discovery) {
+		output_destroy_components(out);
+	} else {
+		// Destroy everything EXCEPT discovery
+		pthread_mutex_lock(&out->output_mutex);
+
+		// Mark stream as inactive before destroying
+		gaze_sender_set_active(&out->sender, false);
+		gaze_sender_destroy(&out->sender);
+		gaze_packetizer_destroy(&out->packetizer);
+		gaze_encoder_destroy(&out->encoder);
+
+		out->components_initialized = false;
+
+		pthread_mutex_unlock(&out->output_mutex);
+	}
+
+	// Read settings (enabled already read above)
+	out->enabled = new_enabled;
 
 	build_prop_name(p, sizeof(p), i, "stream_name");
 	strncpy(out->stream_name, obs_data_get_string(s, p),
@@ -1343,6 +1458,42 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 
 	// Fixed port assignment: GAZE_BASE_PORT + (output_index * 2)
 	out->rtp_port = GAZE_BASE_PORT + (i * 2);
+
+	// Read per-output quality preset and resolve bitrate/FEC
+	build_prop_name(p, sizeof(p), i, "quality_preset");
+	out->quality_preset = (int)obs_data_get_int(s, p);
+
+	if (out->quality_preset == -1) {
+		// Use global settings
+		out->bitrate_kbps = f->bitrate_kbps;
+		out->fec_percent = f->fec_percent;
+	} else {
+		switch (out->quality_preset) {
+		case 0: // Ultra
+			out->bitrate_kbps = GAZE_PRESET_ULTRA_BITRATE;
+			out->fec_percent = GAZE_PRESET_ULTRA_FEC;
+			break;
+		case 1: // High
+			out->bitrate_kbps = GAZE_PRESET_HIGH_BITRATE;
+			out->fec_percent = GAZE_PRESET_HIGH_FEC;
+			break;
+		case 2: // Balanced
+			out->bitrate_kbps = GAZE_PRESET_BALANCED_BITRATE;
+			out->fec_percent = GAZE_PRESET_BALANCED_FEC;
+			break;
+		case 3: // Low
+			out->bitrate_kbps = GAZE_PRESET_LOW_BITRATE;
+			out->fec_percent = GAZE_PRESET_LOW_FEC;
+			break;
+		case 4: // Custom
+		default:
+			build_prop_name(p, sizeof(p), i, "bitrate");
+			out->bitrate_kbps = (uint32_t)obs_data_get_int(s, p);
+			build_prop_name(p, sizeof(p), i, "fec_percent");
+			out->fec_percent = (uint8_t)obs_data_get_int(s, p);
+			break;
+		}
+	}
 
 	// Build converter settings
 	obs_data_t *cs = obs_data_create();
@@ -1514,12 +1665,15 @@ static void *gaze_filter_create(obs_data_t *s, obs_source_t *src)
 
 	// Calculate timestamp offset: wall_clock - obs_time
 	// This allows converting OBS frame timestamps to wall clock for latency measurement
+	// Use 100ns units (10,000,000 per second) for NDI compatibility
 	auto wall_now = std::chrono::system_clock::now();
-	int64_t wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-				  wall_now.time_since_epoch())
-				  .count();
-	int64_t obs_ms = (int64_t)(os_gettime_ns() / 1000000);
-	f->timestamp_offset_ms = wall_ms - obs_ms;
+	int64_t wall_100ns =
+		std::chrono::duration_cast<
+			std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(
+			wall_now.time_since_epoch())
+			.count();
+	int64_t obs_100ns = (int64_t)(os_gettime_ns() / 100);
+	f->timestamp_offset_100ns = wall_100ns - obs_100ns;
 
 	for (int i = 0; i < MAX_GAZE_OUTPUTS; i++) {
 		gaze_output_t *out = &f->outputs[i];

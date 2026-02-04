@@ -88,14 +88,14 @@ bool gaze_packetizer_init(gaze_packetizer_t *pkt, bool enable_fec,
  * @param encoded_data Encoded video data (H.264 or HEVC NAL units)
  * @param encoded_size Size of encoded data
  * @param is_keyframe Whether this is a keyframe
- * @param capture_timestamp_ms Capture timestamp for latency measurement
+ * @param capture_timestamp Capture timestamp in 100ns units (NDI-compatible)
  * @param packets Output: array of packets (valid until next call)
  * @param packet_count Output: number of packets
  * @return true on success, false on failure
  */
 bool gaze_packetizer_packetize(gaze_packetizer_t *pkt,
 			       const uint8_t *encoded_data, size_t encoded_size,
-			       bool is_keyframe, uint32_t capture_timestamp_ms,
+			       bool is_keyframe, uint32_t capture_timestamp,
 			       gaze_packet_t **packets, size_t *packet_count);
 
 /**

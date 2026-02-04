@@ -135,7 +135,7 @@ class GazeFrameHeader:
     header_type: GazePacketType
     frame_type: GazeFrameType
     flags: int
-    capture_timestamp_ms: int
+    capture_timestamp: int  # 100ns units for NDI compatibility
 
     @classmethod
     def parse(cls, data: bytes) -> "GazeFrameHeader":
@@ -148,7 +148,7 @@ class GazeFrameHeader:
             header_type=GazePacketType(hdr_type),
             frame_type=GazeFrameType(frame_type),
             flags=flags,
-            capture_timestamp_ms=capture_ts,
+            capture_timestamp=capture_ts,
         )
 
 

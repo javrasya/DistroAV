@@ -88,7 +88,7 @@ bool gaze_discovery_init(gaze_discovery_t *disc)
 bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 			     uint16_t port, gaze_codec_t codec,
 			     uint32_t width, uint32_t height, uint32_t fps,
-			     uint32_t if_index)
+			     uint32_t if_index, uint32_t ip_addr)
 {
 	if (!disc || !disc->initialized || !name)
 		return false;
@@ -119,6 +119,15 @@ bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 	snprintf(buf, sizeof(buf), "%d", GAZE_PROTOCOL_VERSION);
 	TXTRecordSetValue(&txt_ref, "version", strlen(buf), buf);
 
+	// Add IP address to TXT record if bound to specific interface
+	if (ip_addr != 0) {
+		struct in_addr addr;
+		addr.s_addr = ip_addr;
+		char ip_str[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+		TXTRecordSetValue(&txt_ref, "ip", strlen(ip_str), ip_str);
+	}
+
 	// Register on specific interface (0 = all)
 	DNSServiceErrorType err =
 		DNSServiceRegister(&platform->service_ref, 0, if_index, name,
@@ -143,6 +152,7 @@ bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 	disc->height = height;
 	disc->fps = fps;
 	disc->if_index = if_index;
+	disc->ip_addr = ip_addr;
 
 	// Process the registration (non-blocking check)
 	int fd = DNSServiceRefSockFD(platform->service_ref);
@@ -168,7 +178,7 @@ bool gaze_discovery_update(gaze_discovery_t *disc, uint32_t width,
 	// Re-register with new parameters
 	return gaze_discovery_register(disc, disc->service_name, disc->port,
 				       disc->codec, width, height, fps,
-				       disc->if_index);
+				       disc->if_index, disc->ip_addr);
 }
 
 void gaze_discovery_unregister(gaze_discovery_t *disc)
@@ -202,114 +212,25 @@ void gaze_discovery_destroy(gaze_discovery_t *disc)
 }
 
 #elif defined(_WIN32)
-// Windows - Native dnsapi.dll (like Sunshine)
+// Windows - Use shared mDNS socket per interface
+// This is required because mDNS uses port 5353 and multicast, so multiple
+// sockets on the same interface would conflict. We share a single socket
+// that can announce multiple services.
 #include <WinSock2.h>
+#include <ws2tcpip.h>
 #include <Windows.h>
-#include <WinDNS.h>
-
-// Function pointer types (use SDK types, they're already defined)
-typedef DWORD (*DnsServiceRegister_fn)(PDNS_SERVICE_REGISTER_REQUEST pRequest,
-				       PDNS_SERVICE_CANCEL pCancel);
-typedef DWORD (*DnsServiceDeRegister_fn)(PDNS_SERVICE_REGISTER_REQUEST pRequest,
-					 PDNS_SERVICE_CANCEL pCancel);
-typedef VOID (*DnsServiceFreeInstance_fn)(PDNS_SERVICE_INSTANCE pInstance);
-
-// Global function pointers
-static DnsServiceRegister_fn pDnsServiceRegister = nullptr;
-static DnsServiceDeRegister_fn pDnsServiceDeRegister = nullptr;
-static DnsServiceFreeInstance_fn pDnsServiceFreeInstance = nullptr;
-static HMODULE hDnsApi = nullptr;
-static bool dns_funcs_loaded = false;
+#include "gaze-mdns-shared.h"
 
 struct gaze_discovery_platform {
-	PDNS_SERVICE_INSTANCE instance;
-	wchar_t *instance_name;
-	wchar_t *host_name;
+	gaze_mdns_shared_t *shared_mdns;  // Shared instance (refcounted)
+	int service_slot;                  // Our slot in the shared instance
+	uint8_t txt_buffer[512];
+	size_t txt_len;
 };
-
-// Convert UTF-8 to wide string
-static wchar_t *utf8_to_wide(const char *utf8)
-{
-	if (!utf8)
-		return nullptr;
-	int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
-	if (len <= 0)
-		return nullptr;
-	wchar_t *wide = (wchar_t *)malloc(len * sizeof(wchar_t));
-	if (!wide)
-		return nullptr;
-	MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wide, len);
-	return wide;
-}
-
-// Get computer name
-static char *get_hostname(void)
-{
-	static char hostname[256] = {0};
-	if (hostname[0] == '\0') {
-		DWORD size = sizeof(hostname);
-		GetComputerNameExA(ComputerNameDnsHostname, hostname, &size);
-	}
-	return hostname;
-}
-
-static bool load_dns_functions(void)
-{
-	if (dns_funcs_loaded)
-		return true;
-
-	hDnsApi = LoadLibraryA("dnsapi.dll");
-	if (!hDnsApi) {
-		obs_log(LOG_WARNING,
-			"[gaze-discovery] Failed to load dnsapi.dll");
-		return false;
-	}
-
-	pDnsServiceRegister = (DnsServiceRegister_fn)GetProcAddress(
-		hDnsApi, "DnsServiceRegister");
-	pDnsServiceDeRegister = (DnsServiceDeRegister_fn)GetProcAddress(
-		hDnsApi, "DnsServiceDeRegister");
-	pDnsServiceFreeInstance = (DnsServiceFreeInstance_fn)GetProcAddress(
-		hDnsApi, "DnsServiceFreeInstance");
-
-	if (!pDnsServiceRegister || !pDnsServiceDeRegister ||
-	    !pDnsServiceFreeInstance) {
-		obs_log(LOG_WARNING,
-			"[gaze-discovery] mDNS functions not available in dnsapi.dll (requires Windows 10+)");
-		FreeLibrary(hDnsApi);
-		hDnsApi = nullptr;
-		return false;
-	}
-
-	dns_funcs_loaded = true;
-	obs_log(LOG_INFO, "[gaze-discovery] Windows mDNS support loaded");
-	return true;
-}
-
-// Registration callback (matches DNS_SERVICE_REGISTER_COMPLETE signature)
-static VOID WINAPI register_callback(DWORD status, PVOID context,
-				     PDNS_SERVICE_INSTANCE instance)
-{
-	gaze_discovery_t *disc = (gaze_discovery_t *)context;
-	auto *platform = (gaze_discovery_platform *)disc->platform_handle;
-
-	if (status == ERROR_SUCCESS) {
-		platform->instance = instance;
-		disc->registered = true;
-		obs_log(LOG_INFO,
-			"[gaze-discovery] Registered mDNS service: %s",
-			disc->service_name);
-	} else {
-		disc->registered = false;
-		obs_log(LOG_WARNING,
-			"[gaze-discovery] mDNS registration failed: %lu",
-			status);
-	}
-}
 
 bool gaze_discovery_available(void)
 {
-	return load_dns_functions();
+	return true;  // Shared mDNS is always available
 }
 
 bool gaze_discovery_init(gaze_discovery_t *disc)
@@ -319,33 +240,67 @@ bool gaze_discovery_init(gaze_discovery_t *disc)
 
 	memset(disc, 0, sizeof(*disc));
 
-	if (!load_dns_functions()) {
-		disc->initialized = true; // Still mark as initialized for fallback
-		return true;
-	}
-
 	disc->platform_handle = new gaze_discovery_platform();
 	if (!disc->platform_handle)
 		return false;
 
 	auto *platform = (gaze_discovery_platform *)disc->platform_handle;
-	platform->instance = nullptr;
-	platform->instance_name = nullptr;
-	platform->host_name = nullptr;
+	memset(platform, 0, sizeof(*platform));
+	platform->service_slot = -1;
+
+	obs_log(LOG_INFO, "[gaze-discovery] Shared mDNS initialized");
 
 	disc->initialized = true;
 	return true;
 }
 
+// Helper to build TXT record
+static size_t build_txt_record(uint8_t *txt, size_t capacity,
+			       gaze_codec_t codec, uint32_t width,
+			       uint32_t height, uint32_t fps, uint32_t ip_addr)
+{
+	size_t pos = 0;
+	char buf[32];
+
+	const char *codec_str = (codec == GAZE_CODEC_HEVC) ? "hevc" : "h264";
+	pos = gaze_mdns_shared_add_txt(txt, pos, capacity, "codec", codec_str);
+
+	snprintf(buf, sizeof(buf), "%u", width);
+	pos = gaze_mdns_shared_add_txt(txt, pos, capacity, "width", buf);
+
+	snprintf(buf, sizeof(buf), "%u", height);
+	pos = gaze_mdns_shared_add_txt(txt, pos, capacity, "height", buf);
+
+	snprintf(buf, sizeof(buf), "%u", fps);
+	pos = gaze_mdns_shared_add_txt(txt, pos, capacity, "fps", buf);
+
+	snprintf(buf, sizeof(buf), "%d", GAZE_PROTOCOL_VERSION);
+	pos = gaze_mdns_shared_add_txt(txt, pos, capacity, "version", buf);
+
+	if (ip_addr != 0) {
+		struct in_addr addr;
+		addr.s_addr = ip_addr;
+		char ip_str[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+		pos = gaze_mdns_shared_add_txt(txt, pos, capacity, "ip", ip_str);
+	}
+
+	return pos;
+}
+
 bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 			     uint16_t port, gaze_codec_t codec,
 			     uint32_t width, uint32_t height, uint32_t fps,
-			     uint32_t if_index)
+			     uint32_t if_index, uint32_t ip_addr)
 {
 	if (!disc || !disc->initialized || !name)
 		return false;
 
-	// Store service info regardless of mDNS availability
+	obs_log(LOG_INFO,
+		"[gaze-discovery] register called: name=%s port=%u ip_addr=%u",
+		name, port, ip_addr);
+
+	// Store service info
 	strncpy(disc->service_name, name, sizeof(disc->service_name) - 1);
 	disc->port = port;
 	disc->codec = codec;
@@ -353,100 +308,108 @@ bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 	disc->height = height;
 	disc->fps = fps;
 	disc->if_index = if_index;
+	disc->ip_addr = ip_addr;
 
-	if (!dns_funcs_loaded || !disc->platform_handle) {
-		obs_log(LOG_DEBUG,
-			"[gaze-discovery] mDNS not available, service info stored: %s on port %u",
-			name, port);
-		return true;
-	}
+	if (!disc->platform_handle)
+		return false;
 
 	auto *platform = (gaze_discovery_platform *)disc->platform_handle;
 
-	// Unregister existing service
-	if (platform->instance) {
-		gaze_discovery_unregister(disc);
+	obs_log(LOG_INFO,
+		"[gaze-discovery] current state: shared_mdns=%p service_slot=%d",
+		(void *)platform->shared_mdns, platform->service_slot);
+
+	// Unregister from previous shared instance if different IP
+	// Use lookup_ip (original request) not bind_ip (detected IP)
+	if (platform->shared_mdns) {
+		obs_log(LOG_INFO,
+			"[gaze-discovery] checking switch: lookup_ip=%u vs ip_addr=%u",
+			platform->shared_mdns->lookup_ip, ip_addr);
+	}
+	if (platform->shared_mdns &&
+	    platform->shared_mdns->lookup_ip != ip_addr) {
+		obs_log(LOG_INFO,
+			"[gaze-discovery] SWITCHING shared instance (lookup_ip mismatch)");
+		if (platform->service_slot >= 0) {
+			obs_log(LOG_INFO,
+				"[gaze-discovery] unregistering from slot %d",
+				platform->service_slot);
+			gaze_mdns_shared_unregister(platform->shared_mdns,
+						    platform->service_slot);
+			platform->service_slot = -1;
+		}
+		gaze_mdns_shared_release(platform->shared_mdns);
+		platform->shared_mdns = nullptr;
 	}
 
-	// Build instance name: "StreamName._gazestream._udp.local"
-	char instance_name_utf8[512];
-	snprintf(instance_name_utf8, sizeof(instance_name_utf8),
-		 "%s._gazestream._udp.local", name);
-
-	// Build host name: "HOSTNAME.local"
-	char host_name_utf8[256];
-	snprintf(host_name_utf8, sizeof(host_name_utf8), "%s.local",
-		 get_hostname());
-
-	// Convert to wide strings
-	platform->instance_name = utf8_to_wide(instance_name_utf8);
-	platform->host_name = utf8_to_wide(host_name_utf8);
-
-	if (!platform->instance_name || !platform->host_name) {
-		obs_log(LOG_ERROR,
-			"[gaze-discovery] Failed to convert strings");
-		return false;
+	// Get or create shared instance for this interface
+	if (!platform->shared_mdns) {
+		obs_log(LOG_INFO,
+			"[gaze-discovery] getting shared instance for ip_addr=%u",
+			ip_addr);
+		platform->shared_mdns = gaze_mdns_shared_get(ip_addr);
+		if (!platform->shared_mdns) {
+			obs_log(LOG_ERROR,
+				"[gaze-discovery] Failed to get shared mDNS for IP");
+			return false;
+		}
+		obs_log(LOG_INFO,
+			"[gaze-discovery] got shared instance %p (lookup_ip=%u, bind_ip=%u, ref=%d)",
+			(void *)platform->shared_mdns,
+			platform->shared_mdns->lookup_ip,
+			platform->shared_mdns->bind_ip,
+			platform->shared_mdns->ref_count);
+	} else {
+		obs_log(LOG_INFO,
+			"[gaze-discovery] reusing existing shared instance %p",
+			(void *)platform->shared_mdns);
 	}
 
-	// Build TXT record properties
-	// Format: key=value as wide strings
-	wchar_t txt_codec[32], txt_width[32], txt_height[32], txt_fps[32],
-		txt_version[32];
-	swprintf(txt_codec, 32, L"codec=%hs",
-		 codec == GAZE_CODEC_HEVC ? "hevc" : "h264");
-	swprintf(txt_width, 32, L"width=%u", width);
-	swprintf(txt_height, 32, L"height=%u", height);
-	swprintf(txt_fps, 32, L"fps=%u", fps);
-	swprintf(txt_version, 32, L"version=%d", GAZE_PROTOCOL_VERSION);
+	// Build TXT record
+	platform->txt_len = build_txt_record(
+		platform->txt_buffer, sizeof(platform->txt_buffer),
+		codec, width, height, fps, ip_addr);
 
-	PWSTR keys[] = {(PWSTR)L"codec", (PWSTR)L"width", (PWSTR)L"height",
-			(PWSTR)L"fps", (PWSTR)L"version", nullptr};
-	PWSTR values[] = {txt_codec + 6,   txt_width + 6, txt_height + 7,
-			  txt_fps + 4,     txt_version + 8, nullptr};
+	// Register or update service
+	if (platform->service_slot >= 0) {
+		// Update existing registration
+		obs_log(LOG_INFO,
+			"[gaze-discovery] updating existing slot %d",
+			platform->service_slot);
+		gaze_mdns_shared_update(platform->shared_mdns,
+					platform->service_slot,
+					platform->txt_buffer,
+					platform->txt_len);
+	} else {
+		// New registration
+		obs_log(LOG_INFO,
+			"[gaze-discovery] registering NEW service in shared instance");
+		platform->service_slot = gaze_mdns_shared_register(
+			platform->shared_mdns, name, GAZE_MDNS_SERVICE_TYPE,
+			port, platform->txt_buffer, platform->txt_len);
 
-	// Create service instance
-	DNS_SERVICE_INSTANCE instance = {};
-	instance.pszInstanceName = platform->instance_name;
-	instance.pszHostName = platform->host_name;
-	instance.wPort = port;
-	instance.dwPropertyCount = 5;
-	instance.keys = keys;
-	instance.values = values;
-	// Note: Windows DNS-SD API doesn't directly support interface binding
-	// The if_index is stored for consistency but Windows registers on all interfaces
-
-	// Register
-	DNS_SERVICE_REGISTER_REQUEST request = {};
-	request.Version = DNS_QUERY_REQUEST_VERSION1;
-	request.InterfaceIndex = if_index;  // 0 = all interfaces, or specific interface
-	request.pServiceInstance = &instance;
-	request.pRegisterCompletionCallback = register_callback;
-	request.pQueryContext = disc;
-	request.unicastEnabled = FALSE;
-
-	obs_log(LOG_INFO,
-		"[gaze-discovery] Registering mDNS: %s on port %u, interface %u",
-		name, port, if_index);
-
-	DWORD status = pDnsServiceRegister(&request, nullptr);
-
-	obs_log(LOG_INFO,
-		"[gaze-discovery] DnsServiceRegister returned: %lu (PENDING=%lu, SUCCESS=%lu)",
-		status, (DWORD)DNS_REQUEST_PENDING, (DWORD)ERROR_SUCCESS);
-
-	if (status != DNS_REQUEST_PENDING && status != ERROR_SUCCESS) {
-		obs_log(LOG_WARNING,
-			"[gaze-discovery] DnsServiceRegister failed: %lu",
-			status);
-		return false;
+		if (platform->service_slot < 0) {
+			obs_log(LOG_ERROR,
+				"[gaze-discovery] Failed to register service");
+			return false;
+		}
+		obs_log(LOG_INFO,
+			"[gaze-discovery] registered in slot %d",
+			platform->service_slot);
 	}
 
-	// Wait for callback - may need longer on some systems
-	Sleep(200);
+	disc->registered = true;
 
+	// Log
+	char ip_str[INET_ADDRSTRLEN] = "any";
+	if (ip_addr != 0) {
+		struct in_addr addr;
+		addr.s_addr = ip_addr;
+		inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+	}
 	obs_log(LOG_INFO,
-		"[gaze-discovery] After wait: registered=%d",
-		disc->registered ? 1 : 0);
+		"[gaze-discovery] DONE: %s on port %u, ip=%s (slot %d, shared=%p)",
+		name, port, ip_str, platform->service_slot, (void *)platform->shared_mdns);
 
 	return true;
 }
@@ -457,18 +420,33 @@ bool gaze_discovery_update(gaze_discovery_t *disc, uint32_t width,
 	if (!disc || !disc->initialized)
 		return false;
 
+	// Update stored values
+	disc->width = width;
+	disc->height = height;
+	disc->fps = fps;
+
 	// If not registered yet, do initial registration
 	if (!disc->registered && disc->service_name[0] != '\0') {
 		return gaze_discovery_register(disc, disc->service_name,
 					       disc->port, disc->codec, width,
-					       height, fps, disc->if_index);
+					       height, fps, disc->if_index,
+					       disc->ip_addr);
 	}
 
-	// Re-register with new parameters
-	if (disc->registered) {
-		return gaze_discovery_register(disc, disc->service_name,
-					       disc->port, disc->codec, width,
-					       height, fps, disc->if_index);
+	// Update TXT record
+	if (disc->platform_handle) {
+		auto *platform = (gaze_discovery_platform *)disc->platform_handle;
+
+		if (platform->shared_mdns && platform->service_slot >= 0) {
+			platform->txt_len = build_txt_record(
+				platform->txt_buffer, sizeof(platform->txt_buffer),
+				disc->codec, width, height, fps, disc->ip_addr);
+
+			gaze_mdns_shared_update(platform->shared_mdns,
+						platform->service_slot,
+						platform->txt_buffer,
+						platform->txt_len);
+		}
 	}
 
 	return true;
@@ -481,30 +459,12 @@ void gaze_discovery_unregister(gaze_discovery_t *disc)
 
 	auto *platform = (gaze_discovery_platform *)disc->platform_handle;
 
-	if (platform->instance && pDnsServiceDeRegister) {
-		DNS_SERVICE_REGISTER_REQUEST request = {};
-		request.Version = DNS_QUERY_REQUEST_VERSION1;
-		request.pServiceInstance = platform->instance;
-		request.pRegisterCompletionCallback =
-			register_callback;
-		request.pQueryContext = disc;
-
-		pDnsServiceDeRegister(&request, nullptr);
-		Sleep(50);
-
-		if (pDnsServiceFreeInstance) {
-			pDnsServiceFreeInstance(platform->instance);
-		}
-		platform->instance = nullptr;
-	}
-
-	if (platform->instance_name) {
-		free(platform->instance_name);
-		platform->instance_name = nullptr;
-	}
-	if (platform->host_name) {
-		free(platform->host_name);
-		platform->host_name = nullptr;
+	if (platform->shared_mdns && platform->service_slot >= 0) {
+		gaze_mdns_shared_unregister(platform->shared_mdns,
+					    platform->service_slot);
+		platform->service_slot = -1;
+		obs_log(LOG_INFO, "[gaze-discovery] Service unregistered: %s",
+			disc->service_name);
 	}
 
 	disc->registered = false;
@@ -518,7 +478,14 @@ void gaze_discovery_destroy(gaze_discovery_t *disc)
 	gaze_discovery_unregister(disc);
 
 	if (disc->platform_handle) {
-		delete (gaze_discovery_platform *)disc->platform_handle;
+		auto *platform = (gaze_discovery_platform *)disc->platform_handle;
+
+		if (platform->shared_mdns) {
+			gaze_mdns_shared_release(platform->shared_mdns);
+			platform->shared_mdns = nullptr;
+		}
+
+		delete platform;
 		disc->platform_handle = nullptr;
 	}
 
@@ -752,7 +719,7 @@ bool gaze_discovery_init(gaze_discovery_t *disc)
 bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 			     uint16_t port, gaze_codec_t codec,
 			     uint32_t width, uint32_t height, uint32_t fps,
-			     uint32_t if_index)
+			     uint32_t if_index, uint32_t ip_addr)
 {
 	if (!disc || !disc->initialized || !name)
 		return false;
@@ -764,6 +731,7 @@ bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 	disc->height = height;
 	disc->fps = fps;
 	disc->if_index = if_index;
+	disc->ip_addr = ip_addr;
 
 	if (!disc->platform_handle) {
 		obs_log(LOG_DEBUG,
@@ -788,7 +756,7 @@ bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 
 	// Build TXT record strings
 	char txt_codec[32], txt_width[32], txt_height[32], txt_fps[32],
-		txt_version[32];
+		txt_version[32], txt_ip[48];
 	snprintf(txt_codec, sizeof(txt_codec), "codec=%s",
 		 codec == GAZE_CODEC_HEVC ? "hevc" : "h264");
 	snprintf(txt_width, sizeof(txt_width), "width=%u", width);
@@ -797,13 +765,32 @@ bool gaze_discovery_register(gaze_discovery_t *disc, const char *name,
 	snprintf(txt_version, sizeof(txt_version), "version=%d",
 		 GAZE_PROTOCOL_VERSION);
 
+	// Add IP address to TXT record if bound to specific interface
+	bool has_ip = (ip_addr != 0);
+	if (has_ip) {
+		struct in_addr addr;
+		addr.s_addr = ip_addr;
+		char ip_str[INET_ADDRSTRLEN];
+		inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+		snprintf(txt_ip, sizeof(txt_ip), "ip=%s", ip_str);
+	}
+
 	// Use specific interface if provided, otherwise all interfaces
 	int avahi_if = (if_index > 0) ? (int)if_index : AVAHI_IF_UNSPEC;
 
-	int ret = avahi_entry_group_add_service(
-		platform->group, avahi_if, AVAHI_PROTO_UNSPEC, 0, name,
-		"_gazestream._udp", nullptr, nullptr, port, txt_codec,
-		txt_width, txt_height, txt_fps, txt_version, nullptr);
+	int ret;
+	if (has_ip) {
+		ret = avahi_entry_group_add_service(
+			platform->group, avahi_if, AVAHI_PROTO_UNSPEC, 0, name,
+			"_gazestream._udp", nullptr, nullptr, port, txt_codec,
+			txt_width, txt_height, txt_fps, txt_version, txt_ip,
+			nullptr);
+	} else {
+		ret = avahi_entry_group_add_service(
+			platform->group, avahi_if, AVAHI_PROTO_UNSPEC, 0, name,
+			"_gazestream._udp", nullptr, nullptr, port, txt_codec,
+			txt_width, txt_height, txt_fps, txt_version, nullptr);
+	}
 
 	if (ret < 0) {
 		obs_log(LOG_WARNING,
@@ -832,13 +819,15 @@ bool gaze_discovery_update(gaze_discovery_t *disc, uint32_t width,
 	if (!disc->registered && disc->service_name[0] != '\0') {
 		return gaze_discovery_register(disc, disc->service_name,
 					       disc->port, disc->codec, width,
-					       height, fps, disc->if_index);
+					       height, fps, disc->if_index,
+					       disc->ip_addr);
 	}
 
 	if (disc->registered) {
 		return gaze_discovery_register(disc, disc->service_name,
 					       disc->port, disc->codec, width,
-					       height, fps, disc->if_index);
+					       height, fps, disc->if_index,
+					       disc->ip_addr);
 	}
 
 	return true;

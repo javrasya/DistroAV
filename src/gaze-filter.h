@@ -63,6 +63,11 @@ typedef struct gaze_output {
 	char stream_name[256];
 	uint16_t rtp_port;  // Fixed: GAZE_BASE_PORT + (output_index * 2)
 
+	// Per-output quality settings
+	int quality_preset;       // -1=Use Global, 0-3=presets, 4=Custom
+	uint32_t bitrate_kbps;    // Resolved bitrate (from preset or custom)
+	uint8_t fec_percent;      // Resolved FEC (from preset or custom)
+
 	// Video converter (resolution/crop/fps)
 	ndi_video_converter_t converter;
 
@@ -135,9 +140,10 @@ typedef struct gaze_filter {
 	// OBS video info
 	obs_video_info ovi;
 
-	// Timestamp offset: wall_clock_ms - obs_time_ms at startup
+	// Timestamp offset: wall_clock_100ns - obs_time_100ns at startup
 	// Used to convert OBS frame timestamps to wall clock for latency measurement
-	int64_t timestamp_offset_ms;
+	// Uses 100ns units (10,000,000 per second) for NDI compatibility
+	int64_t timestamp_offset_100ns;
 } gaze_filter_t;
 
 /**

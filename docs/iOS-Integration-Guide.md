@@ -108,6 +108,10 @@ class GazeDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
         // Parse TXT record
         let txtDict = NetService.dictionary(fromTXTRecord: txtData)
 
+        // Extract IP from TXT record if available (preferred over hostname resolution)
+        let directIP = String(data: txtDict["ip"] ?? Data(), encoding: .utf8)
+        let ipAddr = (directIP?.isEmpty == false) ? directIP : nil
+
         let info = GazeStreamInfo(
             name: sender.name,
             host: resolveHost(from: addresses),
@@ -115,7 +119,8 @@ class GazeDiscovery: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
             codec: String(data: txtDict["codec"] ?? Data(), encoding: .utf8) ?? "hevc",
             width: UInt32(String(data: txtDict["width"] ?? Data(), encoding: .utf8) ?? "0") ?? 0,
             height: UInt32(String(data: txtDict["height"] ?? Data(), encoding: .utf8) ?? "0") ?? 0,
-            fps: UInt32(String(data: txtDict["fps"] ?? Data(), encoding: .utf8) ?? "0") ?? 0
+            fps: UInt32(String(data: txtDict["fps"] ?? Data(), encoding: .utf8) ?? "0") ?? 0,
+            ip: ipAddr  // Use this for connection when available
         )
 
         onServiceFound?(info)
@@ -148,9 +153,13 @@ struct GazeStreamInfo {
     let width: UInt32
     let height: UInt32
     let fps: UInt32
+    let ip: String?        // Direct IP address (use this instead of resolving host when available)
 
     var controlPort: UInt16 { port + 1 }
     var isHEVC: Bool { codec.lowercased() == "hevc" }
+
+    /// Returns the IP to connect to. Prefers direct IP from TXT record over hostname resolution.
+    var connectHost: String { ip ?? host }
 }
 ```
 
@@ -432,14 +441,14 @@ struct GazeFrameHeader {
     let headerType: UInt8      // 0x01=video, 0x02=FEC
     let frameType: UInt8       // 0=IDR(keyframe), 1=P, 2=B
     let flags: UInt16
-    let captureTimestampMs: UInt32
+    let captureTimestamp: UInt32  // 100ns units for NDI compatibility
 }
 
 struct GazeFrame {
     let index: UInt32
     let isKeyframe: Bool
     let codec: GazeCodec
-    let captureTimestampMs: UInt32
+    let captureTimestamp: UInt32  // 100ns units for NDI compatibility
     let data: Data
 }
 
@@ -457,7 +466,7 @@ class GazeFrameAssembler {
         let frameIndex: UInt32
         let isKeyframe: Bool
         let codec: GazeCodec
-        let captureTimestampMs: UInt32
+        let captureTimestamp: UInt32  // 100ns units for NDI compatibility
         var packets: [UInt16: Data] = [:]
         var fecSeqs: Set<UInt16> = []
         var receivedMarker = false
@@ -519,7 +528,7 @@ class GazeFrameAssembler {
                 frameIndex: frameIndex,
                 isKeyframe: isKeyframe,
                 codec: codec,
-                captureTimestampMs: captureTs
+                captureTimestamp: captureTs
             )
         }
 
@@ -577,7 +586,7 @@ class GazeFrameAssembler {
             index: buffer.frameIndex,
             isKeyframe: buffer.isKeyframe,
             codec: buffer.codec,
-            captureTimestampMs: buffer.captureTimestampMs,
+            captureTimestamp: buffer.captureTimestamp,
             data: frameData
         )
     }
@@ -660,7 +669,8 @@ class GazeDecoder {
 
         // Decode
         var flagsOut: VTDecodeInfoFlags = []
-        let timestamp = CMTime(value: Int64(frame.captureTimestampMs), timescale: 1000)
+        // Convert 100ns units to CMTime (timescale of 10,000,000 = 100ns resolution)
+        let timestamp = CMTime(value: Int64(frame.captureTimestamp), timescale: 10_000_000)
 
         VTDecompressionSessionDecodeFrame(
             session,
@@ -951,15 +961,19 @@ class GazeStreamViewController: UIViewController {
     }
 
     func connect(to stream: GazeStreamInfo) {
+        // Use direct IP from TXT record if available, otherwise fall back to resolved hostname
+        let connectHost = stream.connectHost
+        print("Connecting to \(stream.name) at \(connectHost):\(stream.port)")
+
         // Optional: Probe first to check status
         Task {
-            if let probe = await GazeProbe.probe(host: stream.host, port: stream.port) {
+            if let probe = await GazeProbe.probe(host: connectHost, port: stream.port) {
                 print("Stream active: \(probe.isActive), resolution: \(probe.width)x\(probe.height)")
             }
         }
 
         // Start receiving
-        receiver = GazeReceiver(host: stream.host, port: stream.port)
+        receiver = GazeReceiver(host: connectHost, port: stream.port)
         receiver?.onPacketReceived = { [weak self] data in
             if let frame = self?.assembler.processPacket(data) {
                 self?.decoder.decode(frame: frame)
@@ -1010,7 +1024,7 @@ Offset  Size  Field
 20      1     Packet type (0x01=video, 0x02=FEC)
 21      1     Frame type (0=IDR/keyframe, 1=P, 2=B)
 22      2     Flags (reserved)
-24      4     Capture timestamp ms (big-endian)
+24      4     Capture timestamp (big-endian, 100ns units for NDI compatibility)
 28+     N     Video payload (HEVC/H264 NAL units, Annex B format)
 ```
 
