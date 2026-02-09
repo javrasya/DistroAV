@@ -84,6 +84,13 @@ typedef struct gaze_output {
 	double crop_w_pct;                      // Width (percentage)
 	double crop_h_pct;                      // Height (percentage)
 
+	// Cached crop results (recalculated only when settings change)
+	bool crop_dirty;                    // Set true when crop settings change
+	int32_t cached_crop_left;
+	int32_t cached_crop_top;
+	uint32_t cached_crop_w;
+	uint32_t cached_crop_h;
+
 	// GPU resources
 	gs_texrender_t *texrender;          // Post-crop resize
 	gs_texrender_t *texrender_precrop;  // Pre-crop resize (optional)

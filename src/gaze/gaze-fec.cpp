@@ -45,6 +45,10 @@
 // Maximum shards per block (RS limit is 255)
 #define MAX_DATA_SHARDS 200
 #define MAX_PARITY_SHARDS 55
+#define MAX_TOTAL_SHARDS (MAX_DATA_SHARDS + MAX_PARITY_SHARDS)
+
+// Initial pool size - covers typical 1080p HEVC frames
+#define INITIAL_POOL_SHARDS 64
 
 uint8_t gaze_fec_parity_count(uint8_t data_count, uint8_t parity_percent)
 {
@@ -69,6 +73,86 @@ bool gaze_fec_available(void)
 	return true;
 }
 
+// Ensure the shard buffer pool has at least 'needed' buffers
+static bool ensure_shard_pool(gaze_fec_t *fec, size_t needed)
+{
+	if (needed <= fec->shard_pool_count)
+		return true;
+
+	size_t new_count = fec->shard_pool_count;
+	if (new_count == 0)
+		new_count = INITIAL_POOL_SHARDS;
+	while (new_count < needed)
+		new_count *= 2;
+
+	uint8_t **new_pool = (uint8_t **)realloc(
+		fec->shard_pool, new_count * sizeof(uint8_t *));
+	if (!new_pool)
+		return false;
+
+	// Allocate new shard buffers
+	for (size_t i = fec->shard_pool_count; i < new_count; i++) {
+		new_pool[i] = (uint8_t *)malloc(fec->shard_size);
+		if (!new_pool[i]) {
+			// Roll back
+			for (size_t j = fec->shard_pool_count; j < i; j++) {
+				free(new_pool[j]);
+				new_pool[j] = nullptr;
+			}
+			fec->shard_pool = new_pool;
+			return false;
+		}
+	}
+
+	fec->shard_pool = new_pool;
+	fec->shard_pool_count = new_count;
+	return true;
+}
+
+// Ensure the shard pointer array has at least 'needed' capacity
+static bool ensure_shard_ptrs(gaze_fec_t *fec, size_t needed)
+{
+	if (needed <= fec->shard_ptrs_capacity)
+		return true;
+
+	size_t new_cap = fec->shard_ptrs_capacity;
+	if (new_cap == 0)
+		new_cap = MAX_TOTAL_SHARDS;
+	while (new_cap < needed)
+		new_cap *= 2;
+
+	uint8_t **new_ptrs = (uint8_t **)realloc(
+		fec->shard_ptrs, new_cap * sizeof(uint8_t *));
+	if (!new_ptrs)
+		return false;
+
+	fec->shard_ptrs = new_ptrs;
+	fec->shard_ptrs_capacity = new_cap;
+	return true;
+}
+
+// Ensure the blocks array has at least 'needed' capacity
+static bool ensure_blocks(gaze_fec_t *fec, size_t needed)
+{
+	if (needed <= fec->blocks_capacity)
+		return true;
+
+	size_t new_cap = fec->blocks_capacity;
+	if (new_cap == 0)
+		new_cap = GAZE_FEC_MAX_BLOCKS_PER_FRAME;
+	while (new_cap < needed)
+		new_cap *= 2;
+
+	gaze_fec_block_t *new_blocks = (gaze_fec_block_t *)realloc(
+		fec->blocks, new_cap * sizeof(gaze_fec_block_t));
+	if (!new_blocks)
+		return false;
+
+	fec->blocks = new_blocks;
+	fec->blocks_capacity = new_cap;
+	return true;
+}
+
 bool gaze_fec_init(gaze_fec_t *fec, uint8_t parity_percent)
 {
 	if (!fec)
@@ -81,6 +165,22 @@ bool gaze_fec_init(gaze_fec_t *fec, uint8_t parity_percent)
 							: parity_percent;
 	fec->shard_size = GAZE_FEC_SHARD_SIZE;
 	fec->initialized = true;
+
+	// Pre-allocate initial pool
+	if (!ensure_shard_pool(fec, INITIAL_POOL_SHARDS)) {
+		fec->initialized = false;
+		return false;
+	}
+
+	if (!ensure_blocks(fec, GAZE_FEC_MAX_BLOCKS_PER_FRAME)) {
+		fec->initialized = false;
+		return false;
+	}
+
+	if (!ensure_shard_ptrs(fec, MAX_TOTAL_SHARDS)) {
+		fec->initialized = false;
+		return false;
+	}
 
 	return true;
 }
@@ -123,73 +223,95 @@ bool gaze_fec_encode(gaze_fec_t *fec, const uint8_t *data, size_t data_size,
 	*blocks = nullptr;
 	*block_count = 0;
 
+	size_t shard_size = fec->shard_size;
+
 	if (fec->parity_percent == 0) {
 		// No FEC requested - create single block with no parity
-		gaze_fec_block_t *blk =
-			(gaze_fec_block_t *)calloc(1, sizeof(gaze_fec_block_t));
-		if (!blk)
-			return false;
-
-		// Calculate number of shards needed
-		size_t shard_size = fec->shard_size;
 		uint8_t data_shards = (uint8_t)((data_size + shard_size - 1) / shard_size);
 
 		if (data_shards > MAX_DATA_SHARDS)
 			data_shards = MAX_DATA_SHARDS;
 
+		// Ensure pool has enough shards
+		if (!ensure_shard_pool(fec, data_shards))
+			return false;
+		if (!ensure_blocks(fec, 1))
+			return false;
+		if (!ensure_shard_ptrs(fec, data_shards))
+			return false;
+
+		// Set up block using pre-allocated storage
+		gaze_fec_block_t *blk = &fec->blocks[0];
 		blk->shard_size = shard_size;
 		blk->data_count = data_shards;
 		blk->parity_count = 0;
 		blk->data_size = data_size;
 
-		// Allocate shards
-		blk->shards = (uint8_t **)calloc(data_shards, sizeof(uint8_t *));
-		if (!blk->shards) {
-			free(blk);
-			return false;
+		// Point shards to pool buffers
+		blk->shards = fec->shard_ptrs;
+		for (uint8_t i = 0; i < data_shards; i++) {
+			blk->shards[i] = fec->shard_pool[i];
 		}
 
 		// Fill data shards
 		size_t offset = 0;
 		for (uint8_t i = 0; i < data_shards; i++) {
-			blk->shards[i] = (uint8_t *)calloc(1, shard_size);
-			if (!blk->shards[i]) {
-				gaze_fec_free_blocks(blk, 1);
-				return false;
-			}
-
 			size_t copy_size = (std::min)(shard_size, data_size - offset);
 			if (copy_size > 0) {
 				memcpy(blk->shards[i], data + offset, copy_size);
 			}
+			// Zero remaining bytes in last shard
+			if (copy_size < shard_size) {
+				memset(blk->shards[i] + copy_size, 0,
+				       shard_size - copy_size);
+			}
 			offset += shard_size;
 		}
 
-		*blocks = blk;
+		*blocks = fec->blocks;
 		*block_count = 1;
 		return true;
 	}
 
 	// Calculate how many blocks we need
-	size_t shard_size = fec->shard_size;
 	size_t max_data_per_block = MAX_DATA_SHARDS * shard_size;
 	size_t num_blocks = (data_size + max_data_per_block - 1) / max_data_per_block;
 
 	if (num_blocks > GAZE_FEC_MAX_BLOCKS_PER_FRAME) {
-		// Data too large - reduce shard count per block
 		num_blocks = GAZE_FEC_MAX_BLOCKS_PER_FRAME;
 	}
 
-	gaze_fec_block_t *blks =
-		(gaze_fec_block_t *)calloc(num_blocks, sizeof(gaze_fec_block_t));
-	if (!blks)
+	if (!ensure_blocks(fec, num_blocks))
+		return false;
+
+	// Calculate total shards needed across all blocks
+	size_t total_shards_needed = 0;
+	size_t data_remaining_calc = data_size;
+	for (size_t b = 0; b < num_blocks; b++) {
+		size_t block_data_size = data_remaining_calc / (num_blocks - b);
+		if (block_data_size > max_data_per_block)
+			block_data_size = max_data_per_block;
+
+		uint8_t ds = (uint8_t)((block_data_size + shard_size - 1) / shard_size);
+		if (ds == 0) ds = 1;
+		if (ds > MAX_DATA_SHARDS) ds = MAX_DATA_SHARDS;
+
+		uint8_t ps = gaze_fec_parity_count(ds, fec->parity_percent);
+		total_shards_needed += ds + ps;
+		data_remaining_calc -= block_data_size;
+	}
+
+	if (!ensure_shard_pool(fec, total_shards_needed))
+		return false;
+	if (!ensure_shard_ptrs(fec, total_shards_needed))
 		return false;
 
 	size_t data_offset = 0;
 	size_t data_remaining = data_size;
+	size_t pool_index = 0;
 
 	for (size_t b = 0; b < num_blocks; b++) {
-		gaze_fec_block_t *blk = &blks[b];
+		gaze_fec_block_t *blk = &fec->blocks[b];
 
 		// Determine how much data goes in this block
 		size_t block_data_size = data_remaining / (num_blocks - b);
@@ -214,20 +336,12 @@ bool gaze_fec_encode(gaze_fec_t *fec, const uint8_t *data, size_t data_size,
 		blk->parity_count = parity_shards;
 		blk->data_size = block_data_size;
 
-		// Allocate all shards
-		blk->shards = (uint8_t **)calloc(total_shards, sizeof(uint8_t *));
-		if (!blk->shards) {
-			gaze_fec_free_blocks(blks, b + 1);
-			return false;
-		}
-
+		// Point shards to pool buffers via the pointer array
+		blk->shards = fec->shard_ptrs + pool_index;
 		for (uint8_t i = 0; i < total_shards; i++) {
-			blk->shards[i] = (uint8_t *)calloc(1, shard_size);
-			if (!blk->shards[i]) {
-				gaze_fec_free_blocks(blks, b + 1);
-				return false;
-			}
+			blk->shards[i] = fec->shard_pool[pool_index + i];
 		}
+		pool_index += total_shards;
 
 		// Fill data shards
 		size_t shard_offset = 0;
@@ -238,6 +352,13 @@ bool gaze_fec_encode(gaze_fec_t *fec, const uint8_t *data, size_t data_size,
 					data_size - (data_offset + shard_offset));
 				memcpy(blk->shards[i], data + data_offset + shard_offset,
 				       actual_copy);
+				// Zero remaining bytes
+				if (actual_copy < shard_size) {
+					memset(blk->shards[i] + actual_copy, 0,
+					       shard_size - actual_copy);
+				}
+			} else {
+				memset(blk->shards[i], 0, shard_size);
 			}
 			shard_offset += shard_size;
 		}
@@ -252,7 +373,7 @@ bool gaze_fec_encode(gaze_fec_t *fec, const uint8_t *data, size_t data_size,
 		data_remaining -= block_data_size;
 	}
 
-	*blocks = blks;
+	*blocks = fec->blocks;
 	*block_count = num_blocks;
 
 	return true;
@@ -260,27 +381,36 @@ bool gaze_fec_encode(gaze_fec_t *fec, const uint8_t *data, size_t data_size,
 
 void gaze_fec_free_blocks(gaze_fec_block_t *blocks, size_t block_count)
 {
-	if (!blocks)
-		return;
-
-	for (size_t b = 0; b < block_count; b++) {
-		gaze_fec_block_t *blk = &blocks[b];
-		if (blk->shards) {
-			uint8_t total = blk->data_count + blk->parity_count;
-			for (uint8_t i = 0; i < total; i++) {
-				free(blk->shards[i]);
-			}
-			free(blk->shards);
-		}
-	}
-
-	free(blocks);
+	// No-op: blocks and shards are now owned by the gaze_fec_t pool.
+	// They are freed in gaze_fec_destroy() instead.
+	(void)blocks;
+	(void)block_count;
 }
 
 void gaze_fec_destroy(gaze_fec_t *fec)
 {
 	if (!fec)
 		return;
+
+	// Free shard pool buffers
+	if (fec->shard_pool) {
+		for (size_t i = 0; i < fec->shard_pool_count; i++) {
+			free(fec->shard_pool[i]);
+		}
+		free(fec->shard_pool);
+		fec->shard_pool = nullptr;
+		fec->shard_pool_count = 0;
+	}
+
+	// Free block array
+	free(fec->blocks);
+	fec->blocks = nullptr;
+	fec->blocks_capacity = 0;
+
+	// Free shard pointer array
+	free(fec->shard_ptrs);
+	fec->shard_ptrs = nullptr;
+	fec->shard_ptrs_capacity = 0;
 
 	fec->initialized = false;
 }

@@ -169,9 +169,15 @@ static void remove_receiver(gaze_sender_t *sender,
 }
 
 // Prune receivers that haven't sent heartbeats within timeout
+// Throttled: only runs once per second to avoid per-frame overhead
 static void prune_inactive_receivers(gaze_sender_t *sender)
 {
 	uint64_t now = os_gettime_ns();
+
+	// Only prune once per second (timeout is 5s, so 1s granularity is fine)
+	if (now - sender->last_prune_ns < 1000000000ULL)
+		return;
+	sender->last_prune_ns = now;
 
 	for (int i = 0; i < GAZE_MAX_RECEIVERS; i++) {
 		if (sender->receivers[i].active &&
@@ -553,12 +559,11 @@ bool gaze_sender_has_receivers(gaze_sender_t *sender)
 	if (!sender || !sender->initialized)
 		return false;
 
-	pthread_mutex_lock(&sender->receiver_mutex);
-	prune_inactive_receivers(sender);
-	bool has = (sender->receiver_count > 0);
-	pthread_mutex_unlock(&sender->receiver_mutex);
-
-	return has;
+	// Lock-free read: receiver_count is updated under mutex by
+	// add_or_update_receiver, remove_receiver, and prune_inactive_receivers.
+	// A brief stale read is acceptable since the timeout is 5 seconds
+	// and pruning happens in send_packets().
+	return (sender->receiver_count > 0);
 }
 
 int gaze_sender_get_receiver_count(gaze_sender_t *sender)

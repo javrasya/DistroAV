@@ -309,26 +309,35 @@ static void process_single_output(gaze_filter_t *f, gaze_output_t *out,
 
 	// Step 2: Calculate crop coordinates from reference point if crop is enabled
 	// Crop is now applied to the pre-crop dimensions, not the original source
+	// Only recalculate when settings change (dirty flag) or dimensions change
 	if (out->converter.enable_crop) {
-		// Calculate top-left coordinates from reference point settings
-		// using pre-crop dimensions as the source
-		int32_t crop_left, crop_top;
-		uint32_t crop_w, crop_h;
-		calculate_crop_topleft(out, precrop_width, precrop_height,
-				       &crop_left, &crop_top, &crop_w, &crop_h);
+		bool dims_changed = (precrop_width != out->known_width ||
+				     precrop_height != out->known_height);
+		if (out->crop_dirty || dims_changed ||
+		    !out->converter.crop_cache_valid) {
+			int32_t crop_left, crop_top;
+			uint32_t crop_w, crop_h;
+			calculate_crop_topleft(out, precrop_width,
+					       precrop_height, &crop_left,
+					       &crop_top, &crop_w, &crop_h);
 
-		// Update converter's crop settings with calculated values
-		out->converter.crop_left = crop_left;
-		out->converter.crop_top = crop_top;
-		out->converter.crop_width = crop_w;
-		out->converter.crop_height = crop_h;
+			out->converter.crop_left = crop_left;
+			out->converter.crop_top = crop_top;
+			out->converter.crop_width = crop_w;
+			out->converter.crop_height = crop_h;
 
-		// Update crop cache directly
-		out->converter.cached_crop_left = crop_left;
-		out->converter.cached_crop_top = crop_top;
-		out->converter.cached_crop_width = crop_w;
-		out->converter.cached_crop_height = crop_h;
-		out->converter.crop_cache_valid = true;
+			out->converter.cached_crop_left = crop_left;
+			out->converter.cached_crop_top = crop_top;
+			out->converter.cached_crop_width = crop_w;
+			out->converter.cached_crop_height = crop_h;
+			out->converter.crop_cache_valid = true;
+
+			out->cached_crop_left = crop_left;
+			out->cached_crop_top = crop_top;
+			out->cached_crop_w = crop_w;
+			out->cached_crop_h = crop_h;
+			out->crop_dirty = false;
+		}
 	}
 
 	// Step 3: Determine final render dimensions
@@ -1566,6 +1575,9 @@ static void update_output(gaze_output_t *out, obs_data_t *s, int i,
 
 	ndi_converter_update(&out->converter, cs);
 	obs_data_release(cs);
+
+	// Mark crop as dirty so it gets recalculated on next render
+	out->crop_dirty = true;
 
 	// Mark for lazy initialization (deferred until first non-rapid render)
 	// This prevents duplicate sockets/mDNS when OBS creates two filter instances in studio mode

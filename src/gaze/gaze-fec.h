@@ -53,11 +53,22 @@ typedef struct gaze_fec_block {
 
 /**
  * FEC encoder state
+ *
+ * Uses a pre-allocated buffer pool to avoid per-frame malloc/free.
+ * Shard buffers persist across frames and are only freed on destroy.
  */
 typedef struct gaze_fec {
 	uint8_t parity_percent; // Parity percentage (0-50)
 	size_t shard_size;      // Size of each shard
 	bool initialized;
+
+	// Pre-allocated buffer pool (avoids per-frame calloc/free)
+	uint8_t **shard_pool;      // Array of pre-allocated shard buffers
+	size_t shard_pool_count;   // Number of allocated shard buffers
+	gaze_fec_block_t *blocks;  // Pre-allocated block array
+	size_t blocks_capacity;    // Number of allocated blocks
+	uint8_t **shard_ptrs;      // Pre-allocated shard pointer array
+	size_t shard_ptrs_capacity; // Capacity of shard pointer array
 } gaze_fec_t;
 
 /**

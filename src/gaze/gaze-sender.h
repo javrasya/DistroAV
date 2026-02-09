@@ -117,6 +117,9 @@ typedef struct gaze_sender {
 	pthread_t control_thread;
 	volatile bool control_running;
 
+	// Pruning throttle: only prune receivers once per second
+	uint64_t last_prune_ns;
+
 	// Double-buffered probe response cache
 	// Buffer 0 or 1 is active; encoder writes to inactive, then swaps
 	gaze_probe_cache_t probe_cache[2];

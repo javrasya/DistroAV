@@ -119,6 +119,18 @@ static bool configure_nvenc(AVCodecContext *ctx, gaze_codec_t codec)
 	return true;
 }
 
+// Check if a codec supports a given pixel format
+static bool codec_supports_pix_fmt(const AVCodec *codec, enum AVPixelFormat fmt)
+{
+	if (!codec || !codec->pix_fmts)
+		return false;
+	for (const enum AVPixelFormat *p = codec->pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+		if (*p == fmt)
+			return true;
+	}
+	return false;
+}
+
 static bool configure_amf(AVCodecContext *ctx, gaze_codec_t codec)
 {
 	// Ultra low latency settings
@@ -133,6 +145,13 @@ static bool configure_amf(AVCodecContext *ctx, gaze_codec_t codec)
 	}
 
 	ctx->max_b_frames = 0;
+
+	// Try BGRA direct input for AMF HEVC (supported in newer FFmpeg builds)
+	// This eliminates CPU-based sws_scale BGRA->NV12 conversion
+	if (codec == GAZE_CODEC_HEVC &&
+	    codec_supports_pix_fmt(ctx->codec, AV_PIX_FMT_BGRA)) {
+		ctx->pix_fmt = AV_PIX_FMT_BGRA;
+	}
 
 	return true;
 }

@@ -187,7 +187,8 @@ bool gaze_packetizer_packetize(gaze_packetizer_t *pkt,
 			for (uint8_t s = 0; s < total_shards; s++) {
 				gaze_packet_t *packet =
 					&pkt->packets[pkt->packet_count];
-				memset(packet, 0, sizeof(*packet));
+				// No memset needed: all fields written by build_rtp_header,
+			// build_frame_meta, build_frame_header, and memcpy below
 
 				// Build headers
 				gaze_packet_header_t *hdr =
@@ -252,7 +253,8 @@ bool gaze_packetizer_packetize(gaze_packetizer_t *pkt,
 		size_t offset = 0;
 		for (size_t i = 0; i < num_packets; i++) {
 			gaze_packet_t *packet = &pkt->packets[pkt->packet_count];
-			memset(packet, 0, sizeof(*packet));
+			// No memset needed: all fields written by build_rtp_header,
+			// build_frame_meta, build_frame_header, and memcpy below
 
 			gaze_packet_header_t *hdr =
 				(gaze_packet_header_t *)packet->data;
